@@ -659,16 +659,23 @@ All errors follow this format:
 
 ## Rate Limiting
 
-**Headers in Response:**
+Implemented via `express-rate-limit` in `backend/src/middleware/rateLimit.js` (as of 2026-09-17). Two limiters, both keyed per-IP:
+
+- **General** (`generalLimiter`, applied to the whole API): 300 requests / 15 min. Skips `/health`.
+- **Auth** (`authLimiter`, not yet wired to a route — there's no `/auth/*` route yet): 10 *failed* attempts / 15 min. Successful requests don't count against it, so a legitimate user's own logins never trigger it — only repeated failures do.
+
+**Headers in Response** — IETF draft-7 (`standardHeaders: 'draft-7'`), not the older `X-RateLimit-*` style:
 ```
-X-RateLimit-Limit: 1000
-X-RateLimit-Remaining: 999
-X-RateLimit-Reset: 1694868000
+RateLimit: limit=300, remaining=299, reset=900
+RateLimit-Policy: 300;w=900
 ```
+`reset` and the `w` (window) value are both in seconds. When a limit is hit, the response is `429` with the standard error body (`RATE_LIMITED`, see above).
+
+Rate-limit state is in-memory (the library's default store) — correct for a single backend instance. If this ever runs as multiple instances behind a load balancer, it needs a shared store (e.g. Redis, already a project dependency) so the limit is enforced across instances rather than reset per-instance.
 
 ---
 
-**API Version:** 1.0  
-**Last Updated:** Sept 16, 2025  
+**API Version:** 1.1 — Rate Limiting section updated to match the actual implementation (was previously aspirational/undocumented format)
+**Last Updated:** Sept 17, 2026  
 **Status:** Ready for implementation  
 **Protocol:** REST with WebSocket for KDS
