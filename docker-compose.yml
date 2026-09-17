@@ -46,8 +46,14 @@ services:
       retries: 5
 
   # RabbitMQ Message Queue
+  # 4.3, not 3.12: 3.12 hit end-of-life (its startup log said so on every
+  # boot). Verified against Docker Hub + rabbitmq.com/release-information
+  # on 2026-09-17: 4.2's community support window already ended
+  # (2026-07-31); 4.3 (released 2026-09-16) is the series currently in
+  # community support, through 2026-11-30. Revisit this pin again once
+  # 4.3 rolls off community support too.
   rabbitmq:
-    image: rabbitmq:3.12-management-alpine
+    image: rabbitmq:4.3-management-alpine
     container_name: snaporder_rabbitmq
     environment:
       RABBITMQ_DEFAULT_USER: guest
