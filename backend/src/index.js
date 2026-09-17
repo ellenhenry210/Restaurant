@@ -10,6 +10,7 @@ import guestSessionRoutes from './routes/guestSession.js';
 import restaurantRoutes from './routes/restaurants.js';
 import menuRoutes from './routes/menus.js';
 import orderRoutes from './routes/orders.js';
+import restaurantOrderRoutes from './routes/restaurantOrders.js';
 
 dotenv.config();
 
@@ -67,6 +68,10 @@ app.use('/v1', menuRoutes); // /v1/restaurants/:id/menus, /v1/meals/:id, /v1/mea
 // Guest ordering — behind authenticateGuest. See routes/orders.js for
 // the full lifecycle and the allergen removal-policy enforcement.
 app.use('/v1/orders', orderRoutes);
+
+// Staff/kitchen side of order management — behind authenticate +
+// authorize(). See routes/restaurantOrders.js.
+app.use('/v1/restaurants/:restaurantId/orders', restaurantOrderRoutes);
 
 async function start() {
   // Fail loudly before accepting any traffic if the schema can't be

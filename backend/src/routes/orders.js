@@ -22,6 +22,12 @@ function validateCreateOrderInput(body) {
       }
     });
   }
+  // Optional — tipping is guest-initiated and entirely at their
+  // discretion, so it's simply absent (not 0, not required) unless
+  // they choose to include it.
+  if (body.tip_amount !== undefined && (typeof body.tip_amount !== 'number' || body.tip_amount < 0)) {
+    errors.push({ field: 'tip_amount', reason: 'must be a non-negative number' });
+  }
   return errors;
 }
 
@@ -43,12 +49,22 @@ router.post('/', authenticateGuest, async (req, res) => {
     });
   }
 
-  const { phone_number, guest_name, items, special_requests } = req.body;
+  const { phone_number, guest_name, items, special_requests, tip_amount: tipAmount } = req.body;
   const { restaurant_id: restaurantId, table_id: tableId } = req.guestSession;
 
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+
+    // Per-restaurant, not a global constant — a restaurant's tax rate is
+    // a fact about that restaurant/jurisdiction, and not everyone
+    // charges a service charge at all (migration 008). Fetched once
+    // here rather than per-item, since it's the same for the whole order.
+    const ratesResult = await client.query(
+      `SELECT tax_rate, service_charge_rate FROM restaurants WHERE id = $1`,
+      [restaurantId]
+    );
+    const { tax_rate: taxRate, service_charge_rate: serviceChargeRate } = ratesResult.rows[0];
 
     // Find-or-create the guest_profile — this IS "on first order",
     // exactly the trigger point the product design (product-vision)
@@ -186,20 +202,32 @@ router.post('/', authenticateGuest, async (req, res) => {
       });
     }
 
-    // No tax/service_charge calculation — not implemented (no rate is
-    // defined anywhere in the schema/design docs). total_amount equals
-    // subtotal for now rather than inventing a percentage; flagged, not
-    // silently assumed to be zero without saying so.
+    // Round to the nearest kobo/cent (2dp) before summing, not after —
+    // summing unrounded fractions and rounding once at the end can land
+    // a cent off from what tax_rate * subtotal alone would show, which
+    // is the kind of "why doesn't this add up" discrepancy a guest
+    // would notice on a receipt.
+    const tax = Math.round(subtotal * Number(taxRate) * 100) / 100;
+    const serviceCharge = Math.round(subtotal * Number(serviceChargeRate) * 100) / 100;
+    // total_amount deliberately does NOT include the tip — matches how a
+    // receipt normally reads ("Total: X, tip at your discretion"), not
+    // folded silently into one number. grand_total (below, in the
+    // response only — not its own column) is the actual amount that
+    // would be charged/paid, for a client that wants one final figure.
+    const totalAmount = subtotal + tax + serviceCharge;
+    const tip = tipAmount ?? 0;
+
     const orderNumberResult = await client.query(`SELECT nextval('order_number_seq') AS n`);
     const orderNumber = `ORD-${new Date().getFullYear()}-${String(orderNumberResult.rows[0].n).padStart(5, '0')}`;
 
     const orderResult = await client.query(
-      `INSERT INTO orders (restaurant_id, table_id, guest_profile_id, order_number, subtotal, total_amount, special_requests)
-       VALUES ($1, $2, $3, $4, $5, $5, $6)
-       RETURNING id, order_number, status, subtotal, total_amount, currency, placed_at`,
-      [restaurantId, tableId, guestProfileId, orderNumber, subtotal, special_requests ?? null]
+      `INSERT INTO orders (restaurant_id, table_id, guest_profile_id, order_number, subtotal, tax, service_charge, total_amount, tip_amount, special_requests)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+       RETURNING id, order_number, status, subtotal, tax, service_charge, total_amount, tip_amount, currency, placed_at`,
+      [restaurantId, tableId, guestProfileId, orderNumber, subtotal, tax, serviceCharge, totalAmount, tip, special_requests ?? null]
     );
     const order = orderResult.rows[0];
+    const grandTotal = Number(order.total_amount) + Number(order.tip_amount);
 
     const insertedItems = [];
     for (const item of preparedItems) {
@@ -224,7 +252,7 @@ router.post('/', authenticateGuest, async (req, res) => {
 
     await client.query('COMMIT');
 
-    res.status(201).json({ ...order, items: insertedItems });
+    res.status(201).json({ ...order, grand_total: grandTotal, items: insertedItems });
   } catch (err) {
     await client.query('ROLLBACK');
     console.error('POST /orders: failed:', err.message);
@@ -250,7 +278,7 @@ router.get('/:id', authenticateGuest, async (req, res) => {
       `SELECT id, restaurant_id, table_id, order_number, status,
               placed_at, confirmed_at, ready_at, served_at, cancelled_at,
               estimated_ready_time, subtotal, tax, service_charge, total_amount,
-              currency, special_requests
+              tip_amount, currency, special_requests
        FROM orders
        WHERE id = $1`,
       [req.params.id]
@@ -263,6 +291,7 @@ router.get('/:id', authenticateGuest, async (req, res) => {
     if (order.table_id !== req.guestSession.table_id || order.restaurant_id !== req.guestSession.restaurant_id) {
       return res.status(403).json({ error: { code: 'FORBIDDEN', message: 'This order does not belong to your table' } });
     }
+    order.grand_total = Number(order.total_amount) + Number(order.tip_amount);
 
     const itemsResult = await pool.query(
       `SELECT id, meal_id, meal_name, meal_price, quantity, status, special_request

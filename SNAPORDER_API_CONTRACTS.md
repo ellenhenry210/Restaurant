@@ -280,7 +280,8 @@ Place an order.
       "special_request": "No oil, extra spicy"
     }
   ],
-  "special_requests": "Table is allergic to peanuts"
+  "special_requests": "Table is allergic to peanuts",
+  "tip_amount": 300
 }
 ```
 `removed_ingredients` are checked against each ingredient's `removal_policy` (`SNAPORDER_AUTHORIZATION.md` Part 3) for **every** item before anything is written:
@@ -288,7 +289,7 @@ Place an order.
 - `caution` → requires that item's `allergen_caution_acknowledged: true`, else **400** asking for it.
 - `can_remove` → honored silently.
 
-`table_id`/`restaurant_id` are NOT in the request body — they come from the authenticated guest session, so a guest can only ever order for the table they actually scanned.
+`table_id`/`restaurant_id` are NOT in the request body — they come from the authenticated guest session, so a guest can only ever order for the table they actually scanned. `tip_amount` is optional and entirely guest-discretion — omit it for no tip; if given, must be a non-negative number.
 
 **Response (201):**
 ```json
@@ -297,7 +298,11 @@ Place an order.
   "order_number": "ORD-2026-00147",
   "status": "placed",
   "subtotal": "6600.00",
-  "total_amount": "6600.00",
+  "tax": "495.00",
+  "service_charge": "660.00",
+  "total_amount": "7755.00",
+  "tip_amount": "300.00",
+  "grand_total": 8055,
   "currency": "NGN",
   "placed_at": "2026-09-17T10:30:00Z",
   "items": [
@@ -305,9 +310,9 @@ Place an order.
   ]
 }
 ```
-`meal_price` on each item is `base_price + sum(addon prices)` — a **snapshot** at order time, so a later menu price change never retroactively changes an already-placed order. **No `tax`/`service_charge`/`payment_url`** — not implemented (no tax rate is defined anywhere in the schema/design), so `total_amount` currently equals `subtotal` exactly; flagged rather than a made-up percentage. No payment integration either (see known gaps).
+`meal_price` on each item is `base_price + sum(addon prices)` — a **snapshot** at order time, so a later menu price change never retroactively changes an already-placed order. `tax`/`service_charge` are computed from the restaurant's own `tax_rate`/`service_charge_rate` (both default to 0, so a restaurant that hasn't configured either simply gets 0 — not a made-up default). `total_amount = subtotal + tax + service_charge`; **`tip_amount` is deliberately excluded from `total_amount`** (a receipt reads "Total: X, tip at your discretion," not one number silently including it) — `grand_total` (`total_amount + tip_amount`) is the actual amount owed, returned in the response but not its own stored column. No `payment_url` — no payment integration exists yet (see known gaps).
 
-**Response (400)** for a meal that doesn't exist/isn't at this restaurant, an unavailable meal, an addon that isn't valid for the meal, or a missing `caution` acknowledgment. **Response (403)** for a blocked (`cannot_remove`) ingredient removal.
+**Response (400)** for a meal that doesn't exist/isn't at this restaurant, an unavailable meal, an addon that isn't valid for the meal, a missing `caution` acknowledgment, or a negative `tip_amount`. **Response (403)** for a blocked (`cannot_remove`) ingredient removal.
 
 ---
 
@@ -326,6 +331,8 @@ Get order status. Ownership is table-based: the order's `table_id` must match th
   "confirmed_at": null,
   "ready_at": null,
   "total_amount": "6600.00",
+  "tip_amount": "300.00",
+  "grand_total": 6900,
   "items": [
     { "id": "item_uuid", "meal_name": "Grilled Chicken Rice", "quantity": 2, "status": "pending", "special_request": "Extra spicy" }
   ]
@@ -334,7 +341,43 @@ Get order status. Ownership is table-based: the order's `table_id` must match th
 
 **Response (403)** `"This order does not belong to your table"` if the order exists but belongs to a different table. **Response (404)** if it doesn't exist at all — verified live that these two cases are distinguishable to a legitimate caller.
 
-**Not yet implemented — staff/kitchen side:** `PATCH /orders/{id}/status` (restaurant staff advancing an order's status) and updating individual item status (kitchen). Guests can create and check their own orders; nothing on the restaurant side can act on them yet. `view_all_orders`, `cancel_order`, `modify_order` (`SNAPORDER_AUTHORIZATION.md` Part 1) remain unenforced — no routes exist for them.
+---
+
+## Order Management (Staff/Kitchen)
+
+Implemented (2026-09-17) — `backend/src/routes/restaurantOrders.js`. Mounted at `/v1/restaurants/{restaurantId}/orders`, behind `authenticate` + `authorize()`. This is the piece flagged as missing right after guest ordering shipped — a guest could place and check their own order, but nothing on the restaurant side could act on one.
+
+### GET `/v1/restaurants/{restaurantId}/orders`
+List a restaurant's orders. Requires `view_all_orders` (waiter, kitchen_staff, manager, owner, system_admin).
+
+**Query Params:** `status` — comma-separated (e.g. `?status=placed,confirmed,preparing` for a kitchen-queue-style view). Omit for all statuses.
+
+**Response (200):** `{ "data": [ {...order fields, no items array...} ] }`
+
+### PATCH `/v1/restaurants/{restaurantId}/orders/{orderId}/status`
+Advance (or cancel) an order. Requires `modify_order` (waiter, manager, owner, system_admin — **not** kitchen_staff). Verified live that a kitchen_staff token is rejected here even though it's accepted on the item-status endpoint below — the two permissions are genuinely different in the RBAC matrix, not interchangeable.
+
+**Request:** `{ "status": "confirmed" }` — one of `placed`, `confirmed`, `preparing`, `ready`, `served`, `cancelled`.
+
+Transitions are validated against a real state machine, not accepted as any-to-any:
+```
+placed → confirmed | cancelled
+confirmed → preparing | cancelled
+preparing → ready | cancelled
+ready → served
+served, cancelled → (final states, no further transitions)
+```
+The relevant timestamp column (`confirmed_at`/`ready_at`/`served_at`/`cancelled_at`) is set automatically.
+
+**Response (200):** `{ "id": "order_uuid", "status": "confirmed", "confirmed_at": "..." }`
+**Response (409)** for an invalid transition (e.g. `confirmed` → `served` directly), naming the actually-valid next state(s). **Response (400)** for an unrecognized status value. **Response (404)** if the order isn't at this restaurant.
+
+### PATCH `/v1/restaurants/{restaurantId}/orders/{orderId}/items/{itemId}/status`
+Update one item's status (the kitchen's actual unit of work). Requires `update_kitchen_item_status` (kitchen_staff, manager, owner, system_admin — **not** waiter — the reverse restriction from the endpoint above).
+
+**Request:** `{ "status": "preparing" }` — one of `pending`, `preparing`, `ready`, `served`, `cancelled`. Same state-machine validation as order status (`pending → preparing|cancelled → ready → served`).
+
+**Response (200):** `{ "id": "item_uuid", "status": "preparing", "prepared_by_staff_id": "uuid" }` — records which staff member actually handled it (`req.actor`, from `authorize()`).
 
 ---
 
@@ -424,6 +467,24 @@ List a restaurant's staff. Requires the `view_staff` permission (Manager/Owner/S
 or `"Role 'waiter' cannot 'view_staff'"`, or `"Your access to this restaurant has been deactivated"`.
 
 **Response (400)** if `restaurantId` isn't a valid UUID; **401** if the token is missing/invalid (from `authenticate`, before `authorize` even runs).
+
+### POST `/v1/restaurants/{restaurantId}/staff`
+Add staff to a restaurant that **already exists** — the other half of a gap flagged earlier: `POST /v1/auth/register` only covers onboarding a brand-new restaurant + its first Owner. Requires `manage_staff` (Owner/System Admin only — a Manager can view staff but not add them).
+
+**Request (new person, no existing account):**
+```json
+{ "email": "waiter@example.ng", "name": "Wendy Waiter", "role": "waiter", "password": "SecurePass123", "phone": "+234..." }
+```
+**Request (person already has a `users` account — e.g. also staff at another restaurant):**
+```json
+{ "email": "existing@example.ng", "name": "Their name here", "role": "manager" }
+```
+`role` must be one of `waiter`, `kitchen_staff`, `manager`, `owner`. Omit `password` entirely when the email already has an account — reuses that login rather than creating a second one (the whole point of the `users`/`restaurant_staff` split, `SNAPORDER_DATABASE_SCHEMA.md` table 19: one person, one login, potentially many restaurants).
+
+**Response (201):** `{ "id": "uuid", "name": "Wendy Waiter", "role": "waiter", "phone": null, "is_active": true, "created_at": "..." }`
+
+**Response (400)** — `password` provided for an email that already has an account (rejected explicitly rather than silently ignored, so the caller can't mistakenly believe they changed someone else's password), missing `password` for a genuinely new account, or an invalid `role`.
+**Response (409)** `"This person is already staff at this restaurant"` if that `user_id`+`restaurant_id` pairing already exists.
 
 ---
 
@@ -722,7 +783,7 @@ Rate-limit state is in-memory (the library's default store) — correct for a si
 
 ---
 
-**API Version:** 1.5 — added Restaurants section (new); rewrote Menu Management and Orders to match the real implementation (`removal_policy` 3-state replacing a stale boolean, guest-session-based order creation replacing the old `X-Guest-Phone` draft, no fake `tax`/`payment_url`)
+**API Version:** 1.6 — tax/service charge/tip now computed (was flagged unimplemented); added Order Management (Staff/Kitchen) section (`GET`/`PATCH` order and item status, real state-machine validated); added `POST /v1/restaurants/{restaurantId}/staff`
 **Last Updated:** Sept 17, 2026  
 **Status:** Ready for implementation  
 **Protocol:** REST with WebSocket for KDS

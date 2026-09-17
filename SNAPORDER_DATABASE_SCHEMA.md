@@ -55,6 +55,12 @@ CREATE TABLE restaurants (
   -- {"monday": {"open": "09:00", "close": "22:00"}, ..., "sunday": null}
   -- (null/absent = closed that day). No write endpoint yet.
   opening_hours JSONB,
+  -- Per-restaurant, not a global constant (migration 008, 2026-09-17) —
+  -- stored as a fraction (0.075 = 7.5%) so applying it is a plain
+  -- multiplication. Default 0: a restaurant's total is never silently
+  -- inflated by an assumed rate it never configured.
+  tax_rate DECIMAL(5, 4) NOT NULL DEFAULT 0,
+  service_charge_rate DECIMAL(5, 4) NOT NULL DEFAULT 0,
   is_active BOOLEAN DEFAULT TRUE,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -64,7 +70,9 @@ CREATE TABLE restaurants (
   ),
   CONSTRAINT chk_restaurants_lat CHECK (latitude IS NULL OR (latitude BETWEEN -90 AND 90)),
   CONSTRAINT chk_restaurants_lon CHECK (longitude IS NULL OR (longitude BETWEEN -180 AND 180)),
-  CONSTRAINT chk_restaurants_max_distance CHECK (max_guest_distance_meters > 0)
+  CONSTRAINT chk_restaurants_max_distance CHECK (max_guest_distance_meters > 0),
+  CONSTRAINT chk_restaurants_tax_rate CHECK (tax_rate BETWEEN 0 AND 1),
+  CONSTRAINT chk_restaurants_service_charge_rate CHECK (service_charge_rate BETWEEN 0 AND 1)
 );
 
 CREATE INDEX idx_restaurants_email ON restaurants(email);
@@ -367,6 +375,8 @@ CREATE INDEX idx_guest_profiles_restaurant ON guest_profiles(restaurant_id);
 
 ### 11. `orders`
 Guest orders. `order_number` values (e.g. `ORD-2026-00147`) are generated from `order_number_seq` (migration 007, 2026-09-17) — `SELECT nextval('order_number_seq')`, not `COUNT(*) + 1`, since a count-based scheme races under concurrent order placement (a `SEQUENCE` is atomic across concurrent transactions; a count isn't). Simplification worth knowing: the sequence does not reset each year — the year in the number is just whatever year it is at issue time, so numbering continues past `00999` into the next year rather than restarting at `00001`.
+
+`tax`/`service_charge`/`total_amount` are computed at order-creation time (`backend/src/routes/orders.js`) from `restaurants.tax_rate`/`service_charge_rate` (migration 008) — `total_amount = subtotal + tax + service_charge`, each rounded to 2dp *before* summing (not after), so the stored figures always add up exactly on a receipt. `tip_amount` is guest-supplied and optional, deliberately excluded from `total_amount` (a receipt reads "Total: X, tip at your discretion," not one number silently including it) — the actual amount owed is `total_amount + tip_amount`, returned as `grand_total` in API responses but not its own stored column.
 
 ```sql
 CREATE TABLE orders (
@@ -806,7 +816,7 @@ BEFORE DELETE DO ... (application-level trigger recommended)
 
 ---
 
-**Schema Version:** 1.6 — migration 006 added `restaurants.opening_hours` (JSONB); migration 007 added `order_number_seq` (atomic, concurrency-safe order numbering, replacing the previously-unimplemented `order_number` generation)
+**Schema Version:** 1.7 — migration 008 added `restaurants.tax_rate`/`service_charge_rate`, now actually applied at order creation (was previously flagged as unimplemented)
 **Last Updated:** Sept 17, 2025
 **Status:** Implemented — see `backend/database/migrations/001_initial_schema.sql` and `backend/database/migrate.js`
 **Database:** PostgreSQL 13+ (running: postgres:15-alpine via docker-compose.yml, host port 5433)
