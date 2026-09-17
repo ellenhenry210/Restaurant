@@ -712,61 +712,54 @@ Revenue reports (daily, weekly, monthly).
 
 ## Kitchen Display System (KDS)
 
-### WebSocket Connection
-Connect to live kitchen display stream.
+Implemented (2026-09-17) — `backend/src/realtime.js`, using Socket.io (already a project dependency), attached to the same HTTP server Express runs on. **Supersedes the draft above this line** (a raw-WebSocket sketch with a `wss://.../ws/kitchen/{restaurantId}` URL and client→server write messages) — real differences, both deliberate:
 
-**Endpoint:** `wss://api.snaporder.ng/v1/ws/kitchen/{restaurantId}`
+1. **Room-based, not a per-restaurant URL.** A client connects once to the default namespace, authenticates via `socket.handshake.auth.token` (the same JWTs as the REST API — staff or guest), and the server joins it to the relevant room(s) server-side. A guest is joined to `table:{tableId}` automatically from their session; staff must emit `join_kitchen` with `{ restaurantId }` after connecting, which re-runs the same ownership/role checks as `authorize('view_all_orders')` (not embedded in the token, resolved fresh — same reasoning as the HTTP API throughout this project).
+2. **Broadcast-only — not a second write path.** The original draft had the kitchen client send `update_item_status`/`order_ready` messages *to* the server. That's not implemented as socket messages: the only way to actually change an order's or item's status is still the existing REST `PATCH` endpoints (`SNAPORDER_AUTHORIZATION.md`-enforced, state-machine validated). Sockets exist purely to broadcast *after* one of those writes commits. Rebuilding that validation a second time as socket handlers would mean two places that could disagree about what transitions are legal.
 
-**Authentication:** Bearer token in query params
+### Connecting
 
-**Messages:**
-
-**New Order (sent from server):**
-```json
-{
-  "type": "new_order",
-  "data": {
-    "order_id": "uuid",
-    "order_number": "ORD-2025-00147",
-    "table_number": 5,
-    "items": [
-      {
-        "id": "item_uuid",
-        "meal_name": "Grilled Chicken Rice",
-        "quantity": 1,
-        "special_request": "No oil",
-        "allergen_warnings": "Peanut-free",
-        "priority": "high"  // "normal", "high" (allergen)
-      }
-    ],
-    "placed_at": "2025-09-16T10:30:00Z"
-  }
-}
+```js
+import { io } from 'socket.io-client';
+const socket = io('https://api.snaporder.ng', { auth: { token: accessTokenOrGuestSessionToken } });
 ```
 
-**Order Update (client → server):**
+No token, or an invalid/expired one, gets an `error` event (`{ message }`) and an immediate disconnect. A valid connection gets a `connected` event: `{ role: 'guest', table_id }` or `{ role: 'staff' }`.
+
+### `join_kitchen` (staff only, client → server, with ack)
+
+```js
+socket.emit('join_kitchen', { restaurantId }, (result) => { /* { ok: true, restaurant_id } or { ok: false, error } */ });
+```
+Denial reasons mirror `authorize()`'s: `"You have no role at this restaurant"`, `"Your access to this restaurant has been deactivated"`, or `"Role '{role}' cannot 'view_all_orders'"`.
+
+### Server → client events
+
+**`new_order`** — to the `kitchen:{restaurantId}` room only, right after `POST /v1/orders` commits:
 ```json
 {
-  "type": "update_item_status",
-  "data": {
-    "order_id": "uuid",
-    "item_id": "item_uuid",
-    "status": "preparing",  // or "ready"
-    "estimated_minutes_left": 8
-  }
+  "order_id": "uuid",
+  "order_number": "ORD-2026-00147",
+  "table_number": 7,
+  "items": [
+    { "id": "item_uuid", "meal_name": "Amala", "quantity": 2, "priority": "normal" }
+  ],
+  "placed_at": "2026-09-17T18:17:52.411Z"
 }
+```
+`priority` is `"high"` when that item's `allergen_caution_acknowledged` was true (a guest confirmed a cross-contamination risk to remove an ingredient) — a narrower signal than the original draft's more general "allergen" priority, but a real, non-speculative one already tracked by the order data.
+
+**`order_status_updated`** — to both `kitchen:{restaurantId}` and `table:{tableId}`, after `PATCH /v1/restaurants/{restaurantId}/orders/{orderId}/status` succeeds:
+```json
+{ "order_id": "uuid", "status": "confirmed" }
 ```
 
-**Order Ready (client → server):**
+**`item_status_updated`** — to the same two rooms, after `PATCH .../items/{itemId}/status` succeeds:
 ```json
-{
-  "type": "order_ready",
-  "data": {
-    "order_id": "uuid",
-    "message": "Order ready for Table 5"
-  }
-}
+{ "order_id": "uuid", "item_id": "uuid", "status": "preparing" }
 ```
+
+Verified live end-to-end: a kitchen socket and a guest socket both correctly received all three broadcast events with accurate data (including `table_number` resolved from the table id, and `prepared_by_staff_id` correctly recorded on the underlying REST response); a connection with no token was rejected; `join_kitchen` for a restaurant the caller has no role at was denied with the expected message.
 
 ---
 
@@ -817,7 +810,7 @@ Rate-limit state is in-memory (the library's default store) — correct for a si
 
 ---
 
-**API Version:** 1.7 — added Table Assignment section (assign/unassign); added `display_name` (customizable staff name) and `server` (who's serving this table, on Guest Session and Order Status) — both from an explicit user request
+**API Version:** 1.8 — Kitchen Display System implemented for real (Socket.io, room-based, broadcast-only) — supersedes the earlier raw-WebSocket draft; `restaurants`/`menus`/`orders` also migrated from routes-only to a models/controllers/routes split (no change to any request/response contract in this document — verified live)
 **Last Updated:** Sept 17, 2026  
 **Status:** Ready for implementation  
 **Protocol:** REST with WebSocket for KDS

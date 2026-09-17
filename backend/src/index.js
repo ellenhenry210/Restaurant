@@ -1,9 +1,12 @@
+import { createServer } from 'node:http';
+
 import express from 'express';
 import dotenv from 'dotenv';
 
 import { generalLimiter, authLimiter } from './middleware/rateLimit.js';
 import { authenticate } from './middleware/auth.js';
 import { initDb } from './init-db.js';
+import { initRealtime } from './realtime.js';
 import authRoutes from './routes/auth.js';
 import staffRoutes from './routes/staff.js';
 import guestSessionRoutes from './routes/guestSession.js';
@@ -118,13 +121,19 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Something went wrong' } });
 });
 
+// An explicit http.Server, not app.listen()'s implicit one — Socket.io
+// needs to attach to the actual HTTP server (to upgrade connections to
+// WebSocket on it), and app.listen() doesn't hand that back to you.
+const httpServer = createServer(app);
+initRealtime(httpServer);
+
 async function start() {
   // Fail loudly before accepting any traffic if the schema can't be
   // brought up to date, rather than serving requests against a database
   // that's silently missing tables.
   await initDb();
 
-  app.listen(PORT, () => {
+  httpServer.listen(PORT, () => {
     console.log(`✅ Server running on http://localhost:${PORT}`);
   });
 }

@@ -1,5 +1,6 @@
 import { pool } from '../db.js';
 import * as orderModel from '../models/orderModel.js';
+import { emitNewOrder } from '../realtime.js';
 
 function validateCreateOrderInput(body) {
   const errors = [];
@@ -216,7 +217,44 @@ export async function create(req, res) {
       insertedItems.push(inserted);
     }
 
+    const tableNumber = await orderModel.findTableNumber(tableId, client);
+
     await client.query('COMMIT');
+
+    // Notify the kitchen display in real time. Deliberately its own
+    // try/catch, separate from the one below: the order is already
+    // successfully committed at this point, so a socket-layer problem
+    // (there shouldn't be one in normal operation — realtime.js is
+    // always initialized in index.js — but if there ever were) must
+    // never turn into a misleading "Failed to create order" response
+    // for an order that, in fact, succeeded.
+    try {
+      emitNewOrder(restaurantId, {
+        order_id: order.id,
+        order_number: order.order_number,
+        table_number: tableNumber,
+        // Zipped with preparedItems by index (both built in the same
+        // per-item loop, same order) rather than reading
+        // allergen_caution_acknowledged off insertedItems — that field
+        // isn't in insertOrderItem's RETURNING clause, and adding it
+        // there just for this would silently change the shape of the
+        // guest-facing order-creation response too, which is a separate
+        // decision this KDS work shouldn't make as a side effect.
+        items: insertedItems.map((item, i) => ({
+          id: item.id,
+          meal_name: item.meal_name,
+          quantity: item.quantity,
+          // Kitchen-relevant signal: this specific item required a
+          // guest to acknowledge a cross-contamination risk — worth
+          // calling out visually, same idea as the "priority" flag in
+          // SNAPORDER_API_CONTRACTS.md's original KDS sketch.
+          priority: preparedItems[i].allergenCautionAcknowledged ? 'high' : 'normal',
+        })),
+        placed_at: order.placed_at,
+      });
+    } catch (err) {
+      console.error('emitNewOrder failed (order was still created successfully):', err.message);
+    }
 
     res.status(201).json({ ...order, grand_total: grandTotal, items: insertedItems });
   } catch (err) {

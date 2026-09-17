@@ -9,6 +9,12 @@ import { pool } from '../db.js';
 // function that always used the module-level pool directly couldn't
 // participate in a caller's transaction at all.
 
+/** @returns {Promise<number|null>} human-friendly table number, for the kitchen display (realtime.js) — orders only store table_id. */
+export async function findTableNumber(tableId, executor = pool) {
+  const result = await executor.query('SELECT table_number FROM tables WHERE id = $1', [tableId]);
+  return result.rows[0]?.table_number ?? null;
+}
+
 /** @returns {Promise<{ tax_rate: string, service_charge_rate: string }>} */
 export async function findRestaurantRates(restaurantId, executor = pool) {
   const result = await executor.query('SELECT tax_rate, service_charge_rate FROM restaurants WHERE id = $1', [restaurantId]);

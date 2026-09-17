@@ -3,6 +3,7 @@ import { Router } from 'express';
 import { pool } from '../db.js';
 import { authenticate } from '../middleware/auth.js';
 import { authorize } from '../middleware/authorize.js';
+import { emitOrderStatusUpdate, emitItemStatusUpdate } from '../realtime.js';
 
 // mergeParams: true — mounted at /v1/restaurants/:restaurantId/orders,
 // needs that :restaurantId in its own req.params (see routes/staff.js
@@ -97,7 +98,7 @@ router.patch('/:orderId/status', authenticate, authorize('modify_order'), async 
 
   try {
     const currentResult = await pool.query(
-      `SELECT status FROM orders WHERE id = $1 AND restaurant_id = $2`,
+      `SELECT status, table_id FROM orders WHERE id = $1 AND restaurant_id = $2`,
       [orderId, restaurantId]
     );
     const current = currentResult.rows[0];
@@ -123,7 +124,18 @@ router.patch('/:orderId/status', authenticate, authorize('modify_order'), async 
       [nextStatus, orderId]
     );
 
-    res.json(result.rows[0]);
+    const updated = result.rows[0];
+
+    // Broadcast-only — see realtime.js's top comment. This never changes
+    // what the HTTP response says; a failure here is logged, not surfaced
+    // as a failed status update (the update itself already succeeded).
+    try {
+      emitOrderStatusUpdate(restaurantId, current.table_id, { order_id: updated.id, status: updated.status });
+    } catch (err) {
+      console.error('emitOrderStatusUpdate failed (status update itself still succeeded):', err.message);
+    }
+
+    res.json(updated);
   } catch (err) {
     console.error('PATCH /restaurants/:restaurantId/orders/:orderId/status: failed:', err.message);
     res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Failed to update order status' } });
@@ -154,9 +166,11 @@ router.patch(
     try {
       // Join through orders to confirm the item actually belongs to a
       // real order at THIS restaurant — an item's own row has no
-      // restaurant_id to check directly.
+      // restaurant_id to check directly. table_id comes along too, for
+      // the realtime broadcast below (order_items has no table_id of
+      // its own either).
       const currentResult = await pool.query(
-        `SELECT oi.status
+        `SELECT oi.status, o.table_id
          FROM order_items oi
          JOIN orders o ON o.id = oi.order_id
          WHERE oi.id = $1 AND oi.order_id = $2 AND o.restaurant_id = $3`,
@@ -188,7 +202,15 @@ router.patch(
         [nextStatus, req.actor.id, itemId]
       );
 
-      res.json(result.rows[0]);
+      const updated = result.rows[0];
+
+      try {
+        emitItemStatusUpdate(restaurantId, current.table_id, { order_id: orderId, item_id: updated.id, status: updated.status });
+      } catch (err) {
+        console.error('emitItemStatusUpdate failed (status update itself still succeeded):', err.message);
+      }
+
+      res.json(updated);
     } catch (err) {
       console.error('PATCH .../items/:itemId/status: failed:', err.message);
       res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Failed to update item status' } });
