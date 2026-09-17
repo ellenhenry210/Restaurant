@@ -153,7 +153,20 @@ manager.wants('view_advanced_analytics') AND restaurant.plan_type IN ('premium',
 
 ### 4. Session/shift context
 
-Kitchen staff should only see orders for the shift they're clocked into, not the full historical queue. **This requires a `shifts` table that doesn't exist yet** — flagged here as a gap, not built as part of this doc, since it wasn't part of the original scope and deserves its own design pass (clock-in/out, shift-to-staff mapping). Until it exists, kitchen queue visibility should fall back to "all of today's active orders for this restaurant," scoped by condition #1 only.
+Kitchen staff should only see orders for the shift they're clocked into, not the full historical queue. This is backed by the `shifts` table in `SNAPORDER_DATABASE_SCHEMA.md`:
+
+```
+staff.currently_clocked_in === EXISTS(shifts WHERE staff_id = staff.id AND clock_out IS NULL)
+```
+
+```sql
+-- Kitchen queue scoping: only show staff who are actually clocked in right now.
+SELECT * FROM restaurant_staff rs
+JOIN shifts s ON s.staff_id = rs.id AND s.clock_out IS NULL
+WHERE rs.restaurant_id = $1 AND rs.role = 'kitchen_staff';
+```
+
+A staff member can only have one active shift at a time (`unique_active_shift_per_staff`), and `shifts.role_during_shift` snapshots their role at clock-in so a later role change doesn't retroactively alter what an already-worked shift was authorized for.
 
 ### 5. State-based
 
@@ -295,7 +308,6 @@ A leaked Waiter token exposes one restaurant's order queue. A leaked System Admi
 ## Part 6: Not Yet Built (explicitly out of scope for this doc)
 
 - `platform_admins` table for System Admin role (currently no schema for platform-level staff — see Part 1 note).
-- `shifts` table for session-context ABAC (kitchen queue scoped to active shift).
 - The actual `backend/src/authorization/permissions.js` matrix and `authenticate`/`authorize` middleware shown in Part 4 — this doc specifies them, doesn't implement them.
 - Migration to apply the `meal_ingredients`/`order_items` schema changes in Part 3.
 - MFA implementation for Owner/System Admin (Part 7) — no TOTP flow exists yet.
@@ -304,6 +316,6 @@ A leaked Waiter token exposes one restaurant's order queue. A leaked System Admi
 
 ---
 
-**Doc version:** 1.1 — added IAM identity-lifecycle framing (Part 0) and PAM (Part 7)
+**Doc version:** 1.2 — added `shifts` table backing for session-context ABAC (Part 2, condition 4)
 **Status:** Design specification, ready for implementation
 **Related:** `SNAPORDER_DATABASE_SCHEMA.md` (schema this model extends), `SNAPORDER_API_CONTRACTS.md` (endpoints this protects), `backend/src/auth.js` (JWT layer this builds on)

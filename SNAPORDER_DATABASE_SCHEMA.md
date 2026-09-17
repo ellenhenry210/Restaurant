@@ -578,11 +578,45 @@ CREATE INDEX idx_audit_date ON audit_log(created_at);
 
 ---
 
+### 18. `shifts`
+Staff clock-in/clock-out records. This is the session-context data that ABAC condition #4 in `SNAPORDER_AUTHORIZATION.md` (Part 2) needs — e.g. scoping the kitchen queue to staff who are actually clocked in, rather than every kitchen staff member who has ever worked at the restaurant.
+
+```sql
+CREATE TABLE shifts (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  restaurant_id UUID NOT NULL REFERENCES restaurants(id) ON DELETE CASCADE,
+  staff_id UUID NOT NULL REFERENCES restaurant_staff(id) ON DELETE CASCADE,
+
+  clock_in TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  clock_out TIMESTAMP,  -- NULL while the shift is still active
+
+  role_during_shift ENUM('waiter', 'kitchen_staff', 'manager', 'owner') NOT NULL,
+  -- Snapshot of restaurant_staff.role at clock-in time, so a later role
+  -- change doesn't retroactively change what this shift was authorized for.
+
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+  CONSTRAINT valid_shift_times CHECK (clock_out IS NULL OR clock_out > clock_in)
+);
+
+CREATE INDEX idx_shifts_staff ON shifts(staff_id);
+
+-- High-traffic query: "who is currently clocked in at this restaurant?"
+CREATE INDEX idx_shifts_restaurant_active ON shifts(restaurant_id) WHERE clock_out IS NULL;
+
+-- A staff member can only have one active (not-yet-clocked-out) shift at a time.
+CREATE UNIQUE INDEX unique_active_shift_per_staff ON shifts(staff_id) WHERE clock_out IS NULL;
+```
+
+---
+
 ## Relationships Summary
 
 ```
 restaurants
   ├─ restaurant_staff (1:M)
+  │  └─ shifts (1:M)
   ├─ tables (1:M)
   ├─ menus (1:M)
   │  └─ meal_categories (1:M)
@@ -610,6 +644,7 @@ feature_suggestions ──── suggestions_votes (1:M)
 - `idx_tables_qr_code` — QR scan lookup (instant)
 - `idx_guest_profiles_phone` — Guest lookup
 - `idx_order_items_order` — Order detail fetch
+- `idx_shifts_restaurant_active` — Who's clocked in right now (kitchen queue ABAC scoping)
 
 **Reporting queries:**
 - `idx_orders_date` — Daily revenue reports
@@ -654,7 +689,7 @@ BEFORE DELETE DO ... (application-level trigger recommended)
 
 ---
 
-**Schema Version:** 1.1 — added RBAC role rename + allergen removal policy fields, see `SNAPORDER_AUTHORIZATION.md`
+**Schema Version:** 1.2 — added `shifts` table for ABAC session-context scoping, see `SNAPORDER_AUTHORIZATION.md`
 **Last Updated:** Sept 17, 2025
 **Status:** Ready for implementation
 **Database:** PostgreSQL 13+
