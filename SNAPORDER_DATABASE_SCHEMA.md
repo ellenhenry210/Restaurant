@@ -56,7 +56,7 @@ CREATE INDEX idx_restaurants_custom_domain ON restaurants(custom_domain);
 ---
 
 ### 2. `restaurant_staff`
-Staff members with roles (manager, chef, waiter, etc.).
+Staff members with roles. Role values and what each can do are the RBAC layer defined in `SNAPORDER_AUTHORIZATION.md` — see that doc for the full permission matrix and the ABAC conditions layered on top (e.g. `restaurant_id` ownership scoping applies to every query against this table and everything it relates to).
 
 ```sql
 CREATE TABLE restaurant_staff (
@@ -67,7 +67,7 @@ CREATE TABLE restaurant_staff (
   email VARCHAR(255),
   phone VARCHAR(20),
   
-  role ENUM('manager', 'chef', 'waiter', 'inventory_manager') NOT NULL,
+  role ENUM('waiter', 'kitchen_staff', 'manager', 'owner') NOT NULL,
   
   is_active BOOLEAN DEFAULT TRUE,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -79,6 +79,8 @@ CREATE TABLE restaurant_staff (
 CREATE INDEX idx_staff_restaurant ON restaurant_staff(restaurant_id);
 CREATE INDEX idx_staff_role ON restaurant_staff(restaurant_id, role);
 ```
+
+Note: this supersedes an earlier draft of this table that used `('manager', 'chef', 'waiter', 'inventory_manager')`. Renamed `chef` → `kitchen_staff` and folded `inventory_manager` into `manager` to match the 6-role platform-wide hierarchy in `SNAPORDER_AUTHORIZATION.md` (Guest → Waiter → Kitchen Staff → Manager → Owner → System Admin). System Admin is platform-level, not restaurant-scoped, so it belongs in a separate `platform_admins` table — not yet created (see Authorization doc, Part 6).
 
 ---
 
@@ -244,7 +246,7 @@ CREATE INDEX idx_ingredients_allergen ON ingredients(allergen_type);
 ---
 
 ### 8. `meal_ingredients`
-Mapping of ingredients to meals (many-to-many with options).
+Mapping of ingredients to meals (many-to-many with options). This is also where the allergen ingredient-removal policy lives — see `SNAPORDER_AUTHORIZATION.md` Part 3 for the full guest/manager/kitchen flow this powers.
 
 ```sql
 CREATE TABLE meal_ingredients (
@@ -252,8 +254,9 @@ CREATE TABLE meal_ingredients (
   meal_id UUID NOT NULL REFERENCES meals(id) ON DELETE CASCADE,
   ingredient_id UUID NOT NULL REFERENCES ingredients(id) ON DELETE CASCADE,
   
-  -- Customization
-  can_be_removed BOOLEAN DEFAULT TRUE,  -- Can guest remove this ingredient?
+  -- Customization / allergen removal policy (manager-set; see SNAPORDER_AUTHORIZATION.md)
+  removal_policy ENUM('can_remove', 'caution', 'cannot_remove') DEFAULT 'can_remove',
+  removal_policy_reason TEXT,  -- shown to guest for 'caution' and 'cannot_remove'
   is_required BOOLEAN DEFAULT FALSE,  -- Must this ingredient be in meal?
   
   quantity DECIMAL(8, 2),  -- How much of ingredient in base meal
@@ -268,6 +271,8 @@ CREATE TABLE meal_ingredients (
 
 CREATE INDEX idx_meal_ingredients_meal ON meal_ingredients(meal_id);
 ```
+
+Note: supersedes an earlier draft that used a plain `can_be_removed BOOLEAN`. The 3-state `removal_policy` replaces it so a restaurant can distinguish "safe to remove" from "removable but risky — guest must acknowledge" from "cannot be safely removed" (default is the permissive `can_remove`; a manager opts specific ingredients into `caution`/`cannot_remove`).
 
 ---
 
@@ -413,6 +418,7 @@ CREATE TABLE order_items (
   
   -- Customization snapshot
   removed_ingredients UUID[],  -- Array of ingredient IDs removed
+  allergen_caution_acknowledged BOOLEAN DEFAULT FALSE,  -- Guest confirmed a 'caution'-level removal (see SNAPORDER_AUTHORIZATION.md Part 3)
   added_addons UUID[],  -- Array of addon IDs added
   special_request TEXT,  -- "No oil", "Extra spicy"
   
@@ -550,7 +556,8 @@ CREATE TABLE audit_log (
   
   action ENUM(
     'order_placed', 'order_cancelled', 'menu_updated',
-    'inventory_updated', 'review_posted', 'staff_login'
+    'inventory_updated', 'review_posted', 'staff_login',
+    'authz_denied'  -- Logged authorization failure; see SNAPORDER_AUTHORIZATION.md Part 5
   ) NOT NULL,
   
   actor_type ENUM('guest', 'staff', 'system') DEFAULT 'system',
@@ -647,7 +654,7 @@ BEFORE DELETE DO ... (application-level trigger recommended)
 
 ---
 
-**Schema Version:** 1.0  
-**Last Updated:** Sept 16, 2025  
-**Status:** Ready for implementation  
+**Schema Version:** 1.1 — added RBAC role rename + allergen removal policy fields, see `SNAPORDER_AUTHORIZATION.md`
+**Last Updated:** Sept 17, 2025
+**Status:** Ready for implementation
 **Database:** PostgreSQL 13+

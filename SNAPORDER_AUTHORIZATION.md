@@ -1,0 +1,309 @@
+# SnapOrder Identity & Access Management (IAM: RBAC + ABAC + PAM)
+
+## Status
+
+**Design specification — not yet implemented in code.** This document formalizes the authorization model that earlier design discussion covered verbally; nothing below existed as a tracked file or database migration before this write-up (2025-09-17). Implementation (middleware, permission matrix in code, schema changes) is separate follow-up work.
+
+## Scope
+
+This is the identity and access backbone for **the entire SnapOrder system** — every resource (menu, inventory, orders, kitchen, payments, analytics, staff, feedback), not a special case scoped to allergen handling. The allergen ingredient-removal policy (Part 3) is one concrete application of this model, not a separate system. IAM is the umbrella: it covers *who someone is* (identity, authentication, lifecycle), *what they're allowed to do* (RBAC + ABAC, Parts 1–2), and *extra controls for the accounts that can do the most damage* (PAM, Part 7).
+
+## Design Philosophy
+
+Three of SnapOrder's core values map directly onto this model:
+- **Authorization:** every action a guest or staff member can take is explicitly permitted, never assumed.
+- **Integrity:** the rules that decide "can this happen" are enforced consistently everywhere (API, kitchen display, admin panel) — not re-implemented ad hoc per screen.
+- **Confidence:** guests and restaurant staff can trust that only the right people can see or change their data — a guest's order, a restaurant's revenue numbers, a kitchen's queue.
+
+The formula that governs every access check:
+
+```
+CAN_ACCESS = (identity is authenticated) AND (RBAC role grants the permission) AND (all applicable ABAC conditions are met) AND (if the account is privileged, PAM controls are satisfied)
+```
+
+Authentication answers "is this really who they claim to be?" RBAC answers "does this *kind* of user generally get to do this?" ABAC answers "given the *specific* data/time/state involved, is it actually okay right now?" PAM answers "if this is a high-privilege account, are the extra safeguards in place?" All applicable layers must pass.
+
+---
+
+## Part 0: IAM — Identity Lifecycle & Authentication
+
+RBAC/ABAC/PAM (Parts 1, 2, 7) are the *access-control* layer of IAM. IAM itself is broader — it also owns how an identity comes to exist, how it proves itself, and how it's retired.
+
+### Identity lifecycle
+
+| Stage | For staff (`restaurant_staff`) | For guests (`guest_profiles`) |
+|---|---|---|
+| **Provisioning** | Owner/Manager creates the staff row with a role (Part 1). No self-signup for staff. | Created automatically on first order (phone number as identifier) — deliberately low-friction, matching the "scan and order" UX. |
+| **Authentication** | Email + password login → JWT (`backend/src/auth.js`, already built). | Phone number / session token; no password — see `SNAPORDER_API_CONTRACTS.md` `X-Guest-Phone` header. |
+| **Role change** | Owner/Manager updates `restaurant_staff.role`. Every role change should be written to `audit_log`. | N/A — guests don't have roles. |
+| **Deprovisioning** | `restaurant_staff.is_active = false` on termination — revokes access immediately, not just at next login (tokens should be checked against `is_active` on each request, not just at issuance, so firing someone doesn't leave a 6h-valid token still working — see JWT_EXPIRY note below). | Guest identity naturally expires with inactivity; no formal offboarding needed since a phone number carries no standing privilege. |
+
+### Authentication mechanics already built
+
+`backend/src/auth.js` provides `generateToken`/`verifyToken` — this is the authentication half of IAM. Notes relevant to this doc:
+- Token lifetime (`JWT_EXPIRY`, currently `6h`) is the window between a deprovisioned account being disabled and their existing token actually stopping to work, *if* verification only checks the signature. To close that gap, `authorize` middleware (Part 4) should re-check `is_active` from the database on every request for staff, not just trust the token's claims — the token proves identity, not current standing.
+- Password storage: `bcryptjs` is already a backend dependency for this — staff passwords must be hashed (never stored/logged in plaintext), consistent with the **Integrity** value.
+
+---
+
+## Part 1: RBAC — Roles
+
+### Role Hierarchy
+
+```
+Guest → Waiter → Kitchen Staff → Manager → Owner
+                                              ↑
+                                    System Admin (platform-level, cross-restaurant)
+```
+
+Each restaurant-scoped role (Waiter → Owner) inherits the permissions of the roles below it in the chain; System Admin sits outside any single restaurant and is granted explicitly, not by inheritance.
+
+| Role | Scope | Identified by | Notes |
+|------|-------|---------------|-------|
+| **Guest** | One table session at one restaurant | Phone number / session token (`guest_profiles`) | No login/password — identity is lightweight by design, matching the "scan and order" UX. |
+| **Waiter** | One restaurant | `restaurant_staff.role = 'waiter'` | Front-of-house; helps guests, doesn't touch menu/inventory config. |
+| **Kitchen Staff** | One restaurant | `restaurant_staff.role = 'kitchen_staff'` | Fulfills orders; sees allergen/removal policy results, cannot override them. |
+| **Manager** | One restaurant | `restaurant_staff.role = 'manager'` | Runs day-to-day operations: menu, inventory, policies, staff scheduling, responds to reviews. |
+| **Owner** | One restaurant (or several, if multi-location) | `restaurant_staff.role = 'owner'` | Everything Manager can do, plus billing/subscription and staff hiring/removal. |
+| **System Admin** | Entire platform, all restaurants | `platform_admins` (new table, see schema notes) | SnapOrder's own team. Support/moderation/platform ops — not a restaurant employee. |
+
+Note on a schema change from the original draft: the earlier `restaurant_staff.role` enum included `chef` and `inventory_manager`. This doc renames `chef` → `kitchen_staff` (matches the role name used throughout this model) and folds `inventory_manager` into `manager` (the specified 6-role hierarchy doesn't carry a separate inventory role — a manager can delegate inventory permissions to specific staff later via an ABAC grant if that turns out to be needed in practice, but there's no evidence yet that it is, so it's left out rather than added speculatively).
+
+### Permission Matrix
+
+`✅` = allowed by role alone (still subject to ABAC conditions in Part 2) · `➖` = not permitted, no code path should allow it regardless of ABAC.
+
+| Permission | Guest | Waiter | Kitchen Staff | Manager | Owner | System Admin |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|
+| **Menu** — view published menu | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Menu** — edit meals/categories | ➖ | ➖ | ➖ | ✅ | ✅ | ✅ |
+| **Menu** — publish/unpublish menu | ➖ | ➖ | ➖ | ✅ | ✅ | ✅ |
+| **Menu** — delete meal | ➖ | ➖ | ➖ | ➖ | ✅ | ✅ |
+| **Inventory** — view stock levels | ➖ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Inventory** — mark ingredient out of stock | ➖ | ➖ | ✅ | ✅ | ✅ | ✅ |
+| **Inventory** — set stock quantities / reorder levels | ➖ | ➖ | ➖ | ✅ | ✅ | ✅ |
+| **Inventory** — set ingredient removal policy (allergen rules) | ➖ | ➖ | ➖ | ✅ | ✅ | ✅ |
+| **Orders** — place order | ✅ | ➖ | ➖ | ➖ | ➖ | ➖ |
+| **Orders** — request ingredient removal | ✅ | ➖ | ➖ | ➖ | ➖ | ➖ |
+| **Orders** — view own order | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Orders** — view all restaurant orders | ➖ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Orders** — cancel order | ✅ (own, before `preparing`) | ✅ | ➖ | ✅ | ✅ | ✅ |
+| **Orders** — modify order after placement | ➖ | ✅ | ➖ | ✅ | ✅ | ✅ |
+| **Kitchen** — view queue | ➖ | ➖ | ✅ | ✅ | ✅ | ✅ |
+| **Kitchen** — update item status (preparing/ready) | ➖ | ➖ | ✅ | ✅ | ✅ | ✅ |
+| **Kitchen** — flag allergen/prep issue | ➖ | ➖ | ✅ | ✅ | ✅ | ✅ |
+| **Kitchen** — override a `cannot_remove` allergen policy | ➖ | ➖ | ➖ | ➖ | ➖ | ➖ |
+| **Payment** — pay for own order | ✅ | ➖ | ➖ | ➖ | ➖ | ➖ |
+| **Payment** — process/reconcile payment | ➖ | ✅ | ➖ | ✅ | ✅ | ✅ |
+| **Payment** — issue refund | ➖ | ➖ | ➖ | ✅ | ✅ | ✅ |
+| **Payment** — view payment history | ➖ | ➖ | ➖ | ✅ | ✅ | ✅ |
+| **Analytics** — view own restaurant's dashboard | ➖ | ➖ | ➖ | ✅ | ✅ | ✅ |
+| **Analytics** — view cross-restaurant platform analytics | ➖ | ➖ | ➖ | ➖ | ➖ | ✅ |
+| **Staff** — view staff list | ➖ | ➖ | ➖ | ✅ | ✅ | ✅ |
+| **Staff** — assign shifts | ➖ | ➖ | ➖ | ✅ | ✅ | ✅ |
+| **Staff** — hire/remove staff | ➖ | ➖ | ➖ | ➖ | ✅ | ✅ |
+| **Staff** — view individual performance | ➖ | ➖ | ➖ | ✅ | ✅ | ✅ |
+| **Feedback** — leave a review | ✅ (own completed order) | ➖ | ➖ | ➖ | ➖ | ➖ |
+| **Feedback** — edit own review | ✅ (within 48h) | ➖ | ➖ | ➖ | ➖ | ➖ |
+| **Feedback** — reply to a review publicly | ➖ | ➖ | ➖ | ✅ | ✅ | ✅ |
+| **Feedback** — vote on a feature suggestion | ✅ | ✅ | ✅ | ✅ | ✅ | ➖ |
+| **Feedback** — approve/remove a review (abuse, spam) | ➖ | ➖ | ➖ | ➖ | ✅ | ✅ |
+| **Suggestions** — set roadmap status (planned/in progress/done) | ➖ | ➖ | ➖ | ➖ | ➖ | ✅ |
+
+This matrix lives as a static constant in application code (`backend/src/authorization/permissions.js`, to be created), not a database table — consistent with starting as a modular monolith rather than building a dynamic permissions engine before there's a proven need for restaurants to customize roles themselves.
+
+---
+
+## Part 2: ABAC — Conditions
+
+RBAC grants a *type* of access; ABAC checks whether the *specific* request is actually allowed given real data. Five condition types recur across the system:
+
+### 1. Data ownership (`restaurant_id` scoping)
+
+The single most important rule in the system: **every restaurant-scoped role can only touch rows belonging to their own `restaurant_id`.**
+
+```
+manager.restaurant_id === resource.restaurant_id
+```
+
+A manager at Restaurant A who is somehow granted a valid session can never view Restaurant B's orders, inventory, staff, or analytics, even though "Manager" the role has the `view_analytics` permission generally. This should be enforced at the query layer (every query scoped by `restaurant_id`, never trusted from the client), not just checked once in middleware.
+
+### 2. Subscription tier (`restaurants.plan_type`)
+
+Some permissions are additionally gated by the restaurant's plan:
+
+| Feature | Minimum plan |
+|---|---|
+| Basic menu + ordering | `free` |
+| Advanced analytics (customer health trends, revenue breakdowns) | `premium` |
+| White-label branding (custom domain, logo, colors) | `basic` |
+| Multi-location staff management | `enterprise` |
+
+```
+manager.wants('view_advanced_analytics') AND restaurant.plan_type IN ('premium', 'enterprise')
+```
+
+### 3. Time-based
+
+| Rule | Field(s) used |
+|---|---|
+| A guest can edit their own review within 48h of posting | `guest_reviews.created_at` |
+| An order is "active" (guest can still cancel/modify via waiter) for up to 1h after placement, or until status leaves `placed`/`confirmed` | `orders.placed_at`, `orders.status` |
+| A menu is only orderable during its active window | `menus.active_from`, `menus.active_until` |
+
+### 4. Session/shift context
+
+Kitchen staff should only see orders for the shift they're clocked into, not the full historical queue. **This requires a `shifts` table that doesn't exist yet** — flagged here as a gap, not built as part of this doc, since it wasn't part of the original scope and deserves its own design pass (clock-in/out, shift-to-staff mapping). Until it exists, kitchen queue visibility should fall back to "all of today's active orders for this restaurant," scoped by condition #1 only.
+
+### 5. State-based
+
+Actions are often only valid when a resource is in a specific state:
+
+| Action | Required state |
+|---|---|
+| Kitchen accepts an order | `orders.status = 'placed'` or `'confirmed'` |
+| Guest cancels their own order | `orders.status IN ('placed', 'confirmed')` — not once `preparing` has started |
+| Manager marks a meal available again | Reverses `meals.is_available = false` |
+| Restaurant responds to a review | `guest_reviews.is_public = true` |
+
+---
+
+## Part 3: Allergen Ingredient-Removal Policy (an ABAC application)
+
+This is the concrete example that prompted this whole document, and it's built entirely from Parts 1–2 above — no separate mechanism.
+
+**Default behavior is permissive.** A guest with an allergy can ask for a specific ingredient to be removed from a dish, and by default the system allows it. A restaurant can override that default per ingredient-per-meal when removal genuinely isn't safe or possible (e.g., an oil blended into a base sauce rather than added as a discrete topping).
+
+### Three-state result
+
+| State | Meaning | Guest sees |
+|---|---|---|
+| `can_remove` | Ingredient is a discrete, separable component. Removal is honored automatically. | Removal applied silently; confirmed in order summary. |
+| `caution` | Removable, but there's a real residual risk (shared fryer oil, cross-contamination in prep area). | A warning shown before the guest confirms; guest must explicitly acknowledge it to proceed. |
+| `cannot_remove` | Ingredient is mixed into the base and can't be safely separated. | Request is blocked, with the reason shown, and the system suggests alternative dishes that don't contain the allergen. |
+
+### Who controls what
+
+- **Manager/Owner** sets the policy per `meal_ingredients` row (`can_remove` / `caution` / `cannot_remove`, plus the reason/warning text shown to the guest).
+- **Guest** can *request* removal of anything; the system — not the guest — decides which of the three states applies, based on the manager's policy.
+- **Kitchen Staff** sees the resolved policy result on the order (e.g., "Remove peanuts [caution: shared fryer]") but has **no override control**. If kitchen genuinely cannot honor a `can_remove` item on a given day (e.g., unexpected prep issue), that's escalated to a manager and logged — it is never silently handled by kitchen changing the outcome the guest already saw.
+
+### Schema changes needed (see also the DB schema doc, updated alongside this file)
+
+```sql
+-- meal_ingredients.can_be_removed (BOOLEAN) becomes a 3-state policy:
+ALTER TABLE meal_ingredients
+  DROP COLUMN can_be_removed,
+  ADD COLUMN removal_policy ENUM('can_remove', 'caution', 'cannot_remove') DEFAULT 'can_remove',
+  ADD COLUMN removal_policy_reason TEXT;  -- shown to guest for 'caution' and 'cannot_remove'
+
+-- order_items needs to record that a guest actually saw and accepted a caution warning:
+ALTER TABLE order_items
+  ADD COLUMN allergen_caution_acknowledged BOOLEAN DEFAULT FALSE;
+```
+
+### Example flow
+
+1. Guest viewing "Jollof Rice" requests peanuts removed (they're allergic).
+2. System looks up `meal_ingredients` for (Jollof Rice, peanuts) → `removal_policy = 'cannot_remove'`, `removal_policy_reason = 'Peanut oil is blended into the base sauce and cannot be separated'`.
+3. Guest sees the block + reason, and the menu suggests "Rice & Beans" (no peanut ingredient) as an alternative.
+4. If instead the policy were `caution` (e.g., "prepared in a shared fryer with peanut oil"), the guest sees the warning, checks a box to acknowledge, and the order proceeds with `allergen_caution_acknowledged = true` recorded.
+5. Either way, the resolved decision — not the raw request — is what reaches the kitchen display, tagged `priority: "high"` (already part of the KDS WebSocket contract in `SNAPORDER_API_CONTRACTS.md`).
+
+---
+
+## Part 4: Enforcement Pattern (API layer)
+
+Every protected endpoint composes two middlewares: authenticate (verifies the JWT — see `backend/src/auth.js`) and authorize (checks RBAC + relevant ABAC conditions for that specific route).
+
+```javascript
+// Illustrative — not yet implemented.
+import { verifyToken } from './auth.js';
+
+function authenticate(req, res, next) {
+  const header = req.headers.authorization; // "Bearer <token>"
+  const token = header?.startsWith('Bearer ') ? header.slice(7) : null;
+  try {
+    req.user = verifyToken(token); // { sub, iat, exp }
+    next();
+  } catch {
+    res.status(401).json({ error: { code: 'UNAUTHORIZED', message: 'Missing or invalid token' } });
+  }
+}
+
+function authorize(permission, { abac } = {}) {
+  return async (req, res, next) => {
+    const actor = await loadActor(req.user.sub); // staff row or guest profile
+    if (!roleGrants(actor.role, permission)) {
+      return res.status(403).json({ error: { code: 'FORBIDDEN', message: `Role '${actor.role}' cannot '${permission}'` } });
+    }
+    if (abac && !(await abac(actor, req))) {
+      return res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Not allowed for this resource/state' } });
+    }
+    req.actor = actor;
+    next();
+  };
+}
+
+// Example route:
+app.put(
+  '/v1/restaurants/:restaurantId/menus/:menuId/meals/:mealId',
+  authenticate,
+  authorize('edit_menu', {
+    abac: (actor, req) => actor.restaurant_id === req.params.restaurantId, // ownership check
+  }),
+  updateMealHandler
+);
+```
+
+---
+
+## Part 5: Audit Trail
+
+Every DENIED authorization decision, and every state-changing ALLOWED one, should be recorded in the existing `audit_log` table (`SNAPORDER_DATABASE_SCHEMA.md`). No new table needed — this uses what's already there:
+
+```sql
+INSERT INTO audit_log (restaurant_id, action, actor_type, actor_id, resource_type, resource_id, changes, ip_address)
+VALUES ($1, 'authz_denied', 'staff', $2, 'menu_meal', $3, '{"permission": "edit_menu", "reason": "wrong_restaurant"}', $4);
+```
+
+`audit_log.action` enum should be extended to include `authz_denied` alongside the existing `order_placed`, `order_cancelled`, `menu_updated`, `inventory_updated`, `review_posted`, `staff_login`.
+
+---
+
+## Part 7: PAM — Privileged Access Management
+
+RBAC/ABAC (Parts 1–2) govern *everyone*. PAM adds extra controls specifically for the accounts that can do the most damage if compromised or misused: **Owner** and **System Admin** (and, situationally, **Manager** when performing destructive actions like refunds or deleting a meal).
+
+### Why these roles need more than RBAC alone
+
+A leaked Waiter token exposes one restaurant's order queue. A leaked System Admin token exposes every restaurant on the platform. The blast radius isn't linear with the permission matrix — it justifies controls beyond "is this role allowed to do this."
+
+### PAM controls
+
+| Control | Applies to | What it means here |
+|---|---|---|
+| **Least privilege by default** | All privileged roles | Owner and System Admin accounts get exactly the permissions in Part 1's matrix — no blanket "superuser" bypass of RBAC/ABAC. A System Admin viewing a restaurant's data still goes through the same ownership checks, logged as platform-level access rather than silently exempted. |
+| **Mandatory MFA** | Owner, System Admin | Email+password alone is not enough for these two roles — a second factor (TOTP app) should be required at login. Manager is a strong candidate to require it too, given refund/policy powers; Waiter/Kitchen Staff don't need it given their limited blast radius. |
+| **Just-in-time elevation** | System Admin | A System Admin's day-to-day access shouldn't include standing read/write into every restaurant's data. Cross-restaurant access should be requested for a specific reason (e.g. a support ticket), time-boxed, and auto-expire — not an always-on permission. |
+| **Privileged session audit** | Owner, System Admin | Every privileged action (refund, staff removal, cross-restaurant analytics view, policy override attempt) is written to `audit_log` with actor, action, resource, and reason — building on the `authz_denied` action already added in Part 5, extended to explicitly log privileged *allowed* actions too, not just denials. |
+| **Credential protection** | Platform secrets | `JWT_SECRET` and database credentials are the platform's own "privileged accounts" — they must live only in environment variables (already the case per `.env`/`.env.example`), be rotated periodically, and never appear in logs, error messages, or client-visible responses. |
+| **Break-glass procedure** | System Admin | For genuine emergencies (e.g. a restaurant locked out and unreachable), a documented emergency-access path should exist — but it must still be logged and require post-hoc justification, not be a silent bypass. Not yet designed; flagged in Part 6. |
+
+---
+
+## Part 6: Not Yet Built (explicitly out of scope for this doc)
+
+- `platform_admins` table for System Admin role (currently no schema for platform-level staff — see Part 1 note).
+- `shifts` table for session-context ABAC (kitchen queue scoped to active shift).
+- The actual `backend/src/authorization/permissions.js` matrix and `authenticate`/`authorize` middleware shown in Part 4 — this doc specifies them, doesn't implement them.
+- Migration to apply the `meal_ingredients`/`order_items` schema changes in Part 3.
+- MFA implementation for Owner/System Admin (Part 7) — no TOTP flow exists yet.
+- Just-in-time elevation and break-glass workflow for System Admin (Part 7) — currently only specified as a requirement, not designed in detail.
+- Re-checking `restaurant_staff.is_active` on every authenticated request rather than only at token issuance (Part 0) — needed so deprovisioning is immediate, not delayed until token expiry.
+
+---
+
+**Doc version:** 1.1 — added IAM identity-lifecycle framing (Part 0) and PAM (Part 7)
+**Status:** Design specification, ready for implementation
+**Related:** `SNAPORDER_DATABASE_SCHEMA.md` (schema this model extends), `SNAPORDER_API_CONTRACTS.md` (endpoints this protects), `backend/src/auth.js` (JWT layer this builds on)
