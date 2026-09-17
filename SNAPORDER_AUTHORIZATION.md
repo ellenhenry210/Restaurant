@@ -184,6 +184,20 @@ Actions are often only valid when a resource is in a specific state:
 | Manager marks a meal available again | Reverses `meals.is_available = false` |
 | Restaurant responds to a review | `guest_reviews.is_public = true` |
 
+### 6. Geo-proximity (guest access) — implemented 2026-09-17
+
+The product requirement stated plainly by the user: guests "can only have access to the site when in the place or a short distance from the place." A QR code alone isn't proof of physical presence — it can be photographed and shared — so a guest's actual location at scan time is checked against the restaurant's.
+
+```
+CAN_ISSUE_GUEST_SESSION = haversine_distance(guest.reported_location, restaurant.location) <= restaurant.max_guest_distance_meters
+```
+
+- `restaurants.latitude`/`longitude`/`max_guest_distance_meters` (table 1) — per-restaurant, not a global constant, consistent with the white-label customizability requirement (a restaurant with a large lot reasonably wants a bigger radius than one on a single storefront).
+- **Fails closed:** a restaurant with no `latitude`/`longitude` configured blocks guest sessions entirely — there's nothing to check distance against, so "unchecked" is not a safe default here.
+- `backend/src/geo.js` — Haversine distance, verified against known reference distances (e.g. London–Paris ≈ 344km) before being trusted for anything.
+- `POST /v1/tables/:qrCodeId/scan` (`backend/src/routes/guestSession.js`) is where this is actually enforced — see `SNAPORDER_API_CONTRACTS.md`. A successful check issues a `guest_sessions` row (table 20) and a short-lived (`GUEST_SESSION_EXPIRY`, default 4h) guest JWT.
+- Unlike staff tokens, a guest token's `restaurant_id`/`table_id` ARE embedded directly (not resolved fresh per request) — a deliberate difference from the staff design in Part 0/Part 4: a guest session's table doesn't change mid-session the way a staff member's role can, so there's no staleness risk to avoid. The session row is still the source of truth for whether it's still *valid* (`authenticateGuest` checks `expires_at` against the row, not just the JWT's own `exp` — verified live that revoking a session early, before its JWT naturally expires, is honored immediately).
+
 ---
 
 ## Part 3: Allergen Ingredient-Removal Policy (an ABAC application)
@@ -304,15 +318,15 @@ A leaked Waiter token exposes one restaurant's order queue. A leaked System Admi
 
 ## Part 6: Not Yet Built (explicitly out of scope for this doc)
 
-- `platform_admins` table for System Admin role (currently no schema for platform-level staff — see Part 1 note). Also means `authorize()` cannot grant any `system_admin`-only permission yet — there's no way to check whether a user is one.
-- Guest-side enforcement (place order, request ingredient removal, leave/edit review, vote on a suggestion) — `authorize()` only covers the four `restaurant_staff` roles. Guests aren't authenticated via `users`/JWT at all (phone-only, see Part 0), so they need a different enforcement mechanism, not an extension of this one.
+- ~~`platform_admins` table~~ **DONE 2026-09-17** (migration 004) — `requirePlatformAdmin()` (`backend/src/middleware/authorizePlatform.js`) is the System Admin counterpart to `authorize()`. Verified live in isolation (denied, then allowed after granting) — **no real route uses it yet**, since no platform-level resource (cross-restaurant analytics, roadmap status) exists to protect.
+- ~~Guest-side enforcement~~ **PARTIALLY DONE 2026-09-17:** guest *identity and access-gating* is built — `POST /v1/tables/:qrCodeId/scan` (proximity-checked, Part 2 condition 6) issues a session, `authenticateGuest` verifies it. What's still missing is everything a guest would actually *do* with that session — `place_order`, `request_ingredient_removal`, `leave_review`, `vote_suggestion` (Part 1) have no routes yet. The identity mechanism guest actions will need is now built; the actions themselves aren't.
 - Adding staff (Waiter/Kitchen Staff/Manager) to an *existing* restaurant — `POST /v1/auth/register` only covers onboarding a brand-new restaurant + its Owner (Part 0). There's no route yet for an Owner/Manager to add other staff to a restaurant that already exists. (The `authorize()` end-to-end test had to insert a staff row directly via SQL for exactly this reason.)
-- Almost every actual resource route the permission matrix (Part 1) covers — menu, inventory, orders, kitchen, payment, analytics. `GET /v1/restaurants/:restaurantId/staff` (`view_staff`) is the only one wired up so far, built specifically to prove `authorize()` works end-to-end.
+- Almost every actual resource route the permission matrix (Part 1) covers — menu, inventory, orders, kitchen, payment, analytics. `GET /v1/restaurants/:restaurantId/staff` (`view_staff`) remains the only staff-side one wired up so far.
 - MFA implementation for Owner/System Admin (Part 7) — no TOTP flow exists yet.
 - Just-in-time elevation and break-glass workflow for System Admin (Part 7) — currently only specified as a requirement, not designed in detail.
 
 ---
 
-**Doc version:** 1.4 — `authorize` implemented (`backend/src/middleware/authorize.js`, `backend/src/authorization/permissions.js`), audit logging for denials implemented (`backend/src/audit.js`), Parts 4–5 rewritten to match, first real protected route (`GET /v1/restaurants/:restaurantId/staff`) added and verified end-to-end
+**Doc version:** 1.5 — added ABAC condition 6 (geo-proximity, Part 2) and its implementation (`backend/src/geo.js`, `backend/src/routes/guestSession.js`, `backend/src/middleware/authGuest.js`); `platform_admins` + `requirePlatformAdmin` implemented (`backend/src/middleware/authorizePlatform.js`); Part 6 updated to match
 **Status:** Design specification, ready for implementation
 **Related:** `SNAPORDER_DATABASE_SCHEMA.md` (schema this model extends), `SNAPORDER_API_CONTRACTS.md` (endpoints this protects), `backend/src/auth.js` (JWT layer this builds on)

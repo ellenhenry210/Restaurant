@@ -15,7 +15,10 @@ import { pool } from './db.js';
  * it doesn't go completely unnoticed).
  */
 export async function logAudit({
-  restaurantId,
+  // null (not just omitted) for platform-level actions with no single
+  // restaurant to attach to — audit_log.restaurant_id is nullable for
+  // exactly this (migration 005).
+  restaurantId = null,
   action,
   actorType = 'system',
   actorId = null,

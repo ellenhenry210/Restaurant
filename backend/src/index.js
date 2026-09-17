@@ -6,6 +6,7 @@ import { authenticate } from './middleware/auth.js';
 import { initDb } from './init-db.js';
 import authRoutes from './routes/auth.js';
 import staffRoutes from './routes/staff.js';
+import guestSessionRoutes from './routes/guestSession.js';
 
 dotenv.config();
 
@@ -45,6 +46,12 @@ app.get('/v1/me', authenticate, (req, res) => {
 
 // First real use of authorize() — see routes/staff.js.
 app.use('/v1/restaurants/:restaurantId/staff', staffRoutes);
+
+// Guest entry point: POST /v1/tables/:qrCodeId/scan (proximity-gated
+// session issuance) and GET /v1/guest/session (authenticateGuest demo).
+// Not behind authenticate/authorize — guests have no staff identity at
+// all; see routes/guestSession.js and middleware/authGuest.js.
+app.use('/v1', guestSessionRoutes);
 
 async function start() {
   // Fail loudly before accepting any traffic if the schema can't be

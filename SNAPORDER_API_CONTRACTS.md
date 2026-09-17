@@ -102,6 +102,54 @@ Note this is the base `users` row only (id/email/created_at) — not role or res
 
 ---
 
+## Guest Session
+
+Implemented 2026-09-17 (`backend/src/routes/guestSession.js`). This is the actual entry point of the guest experience — scanning the table's QR code — and where the product's proximity requirement is enforced: "guests can only have access when in the place or a short distance from it." Not behind `authenticate`/`authorize` — a guest has no identity yet at this point; that's what these routes create.
+
+### POST `/v1/tables/{qrCodeId}/scan`
+Scan a table's QR code. Requires the guest's current coordinates (read from the browser's Geolocation API on the frontend) — the request fails if they're too far from the restaurant.
+
+**Request:**
+```json
+{ "latitude": 6.5244, "longitude": 3.3792 }
+```
+
+**Response (201):**
+```json
+{
+  "session_token": "eyJhbGciOiJIUzI1NiIs...",
+  "expires_at": "2026-09-17T18:09:19.000Z",
+  "restaurant": { "id": "uuid", "name": "Geo Test Diner" },
+  "distance_meters": 50
+}
+```
+
+**Response (403)** — one of three distinct reasons:
+```json
+{ "error": { "code": "FORBIDDEN", "message": "You need to be at {restaurant} to order here — you appear to be about {N}m away (max {M}m)." } }
+```
+or `"This restaurant has not configured its location yet — guest ordering is unavailable until it does"` (fails closed, not open, if the restaurant hasn't set its location), or `"This table is not currently active"`.
+
+**Response (404)** if the QR code doesn't match any table. **Response (400)** if `latitude`/`longitude` are missing or out of range.
+
+### GET `/v1/guest/session`
+"Who is this guest session" — the guest counterpart to `GET /v1/me`, and the way to verify a stored session token is still good (e.g. on page reload).
+
+**Headers:** `Authorization: Bearer <session_token>`
+
+**Response (200):**
+```json
+{
+  "session": { "id": "uuid", "table_id": "uuid", "restaurant_id": "uuid", "guest_profile_id": null, "expires_at": "2026-09-17T18:09:19.000Z" },
+  "restaurant_name": "Geo Test Diner",
+  "table_number": 1
+}
+```
+
+**Response (401)** if the token is missing, expired, not a guest-type token (e.g. a staff token was used here by mistake), or the session no longer exists — including if it was revoked early (`guest_sessions.expires_at` set into the past), even though the JWT itself hasn't naturally expired yet.
+
+---
+
 ## Menu Management
 
 ### GET `/restaurants/{restaurantId}/menus`
@@ -737,7 +785,7 @@ Rate-limit state is in-memory (the library's default store) — correct for a si
 
 ---
 
-**API Version:** 1.3 — added Staff Management section (`GET /v1/restaurants/{restaurantId}/staff`), the first route enforced by `authorize()`
+**API Version:** 1.4 — added Guest Session section (`POST /v1/tables/{qrCodeId}/scan`, `GET /v1/guest/session`) — proximity-gated guest access
 **Last Updated:** Sept 17, 2026  
 **Status:** Ready for implementation  
 **Protocol:** REST with WebSocket for KDS

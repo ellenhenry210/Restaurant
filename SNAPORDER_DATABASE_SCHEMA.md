@@ -40,6 +40,14 @@ CREATE TABLE restaurants (
   subscription_start_date DATE,
   subscription_end_date DATE,
   
+  -- Guest proximity gating (migration 003, 2026-09-17) — see table 20,
+  -- `guest_sessions`, and SNAPORDER_AUTHORIZATION.md Part 2 condition 6.
+  -- NULL lat/long means guest ordering is unavailable at this restaurant
+  -- (fails closed, not open) until it's configured.
+  latitude DECIMAL(9, 6),
+  longitude DECIMAL(9, 6),
+  max_guest_distance_meters INT NOT NULL DEFAULT 150,
+  
   -- Operational
   timezone VARCHAR(50) DEFAULT 'Africa/Lagos',
   is_active BOOLEAN DEFAULT TRUE,
@@ -48,7 +56,10 @@ CREATE TABLE restaurants (
   
   CONSTRAINT valid_colors CHECK (
     primary_color ~* '^#[0-9A-Fa-f]{6}$' OR primary_color IS NULL
-  )
+  ),
+  CONSTRAINT chk_restaurants_lat CHECK (latitude IS NULL OR (latitude BETWEEN -90 AND 90)),
+  CONSTRAINT chk_restaurants_lon CHECK (longitude IS NULL OR (longitude BETWEEN -180 AND 180)),
+  CONSTRAINT chk_restaurants_max_distance CHECK (max_guest_distance_meters > 0)
 );
 
 CREATE INDEX idx_restaurants_email ON restaurants(email);
@@ -572,7 +583,7 @@ Audit trail for all critical actions.
 ```sql
 CREATE TABLE audit_log (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  restaurant_id UUID NOT NULL REFERENCES restaurants(id) ON DELETE CASCADE,
+  restaurant_id UUID REFERENCES restaurants(id) ON DELETE CASCADE,  -- nullable: see note below
   
   action ENUM(
     'order_placed', 'order_cancelled', 'menu_updated',
@@ -594,7 +605,10 @@ CREATE TABLE audit_log (
 
 CREATE INDEX idx_audit_restaurant ON audit_log(restaurant_id);
 CREATE INDEX idx_audit_date ON audit_log(created_at);
+CREATE INDEX idx_audit_platform ON audit_log(action) WHERE restaurant_id IS NULL;
 ```
+
+Note: `restaurant_id` was originally `NOT NULL` — migration 005 (2026-09-17) relaxed it. Adding `platform_admins` (table 21) meant a denied System Admin check has no single restaurant to attach to; `NULL` here specifically means "a platform-level action, not scoped to any restaurant," not "unknown."
 
 ---
 
@@ -652,15 +666,69 @@ Implementation notes (`backend/src/routes/auth.js`):
 
 ---
 
+### 20. `guest_sessions`
+Issued after a successful proximity check at QR-scan time (migration 003, 2026-09-17) — see `restaurants.latitude`/`longitude`/`max_guest_distance_meters` (table 1) and `SNAPORDER_AUTHORIZATION.md` Part 2 condition 6. Deliberately its own table rather than a bare stateless JWT: it's a real audit trail of exactly where/when each session was granted (useful for security review and spotting abuse like GPS spoofing), and a place to revoke a session early if ever needed.
+
+```sql
+CREATE TABLE guest_sessions (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  table_id UUID NOT NULL REFERENCES tables(id) ON DELETE CASCADE,
+  restaurant_id UUID NOT NULL REFERENCES restaurants(id) ON DELETE CASCADE,
+  guest_profile_id UUID REFERENCES guest_profiles(id) ON DELETE SET NULL,  -- NULL until the guest actually places an order
+
+  scan_latitude DECIMAL(9, 6) NOT NULL,
+  scan_longitude DECIMAL(9, 6) NOT NULL,
+  distance_meters DECIMAL(10, 2) NOT NULL,  -- distance at scan time, kept even though the request succeeded
+
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  expires_at TIMESTAMP NOT NULL,
+
+  CONSTRAINT chk_guest_sessions_lat CHECK (scan_latitude BETWEEN -90 AND 90),
+  CONSTRAINT chk_guest_sessions_lon CHECK (scan_longitude BETWEEN -180 AND 180)
+);
+
+CREATE INDEX idx_guest_sessions_table ON guest_sessions(table_id);
+CREATE INDEX idx_guest_sessions_restaurant ON guest_sessions(restaurant_id);
+CREATE INDEX idx_guest_sessions_expires ON guest_sessions(expires_at);
+```
+
+Implementation (`backend/src/routes/guestSession.js`, `backend/src/geo.js`, `backend/src/middleware/authGuest.js`):
+- `POST /v1/tables/:qrCodeId/scan` computes the Haversine distance between the guest's reported coordinates and the restaurant's, and issues a session (a JWT with `type: 'guest'`, `expires_at` here set to exactly match the JWT's own `exp`) only if within `max_guest_distance_meters`.
+- **Fails closed:** a restaurant with `latitude`/`longitude` still `NULL` blocks guest ordering entirely rather than allowing it unchecked.
+- `authenticateGuest` re-checks `expires_at` against this row on every request, not just the JWT's own expiry — so a session can be revoked early (e.g. by an operator) by updating this row, taking effect immediately rather than waiting for the JWT to naturally expire. Verified live: setting `expires_at` into the past blocks a token whose JWT signature/exp were still otherwise valid.
+
+---
+
+### 21. `platform_admins`
+Backs the System Admin role (migration 004, 2026-09-17) — SnapOrder's own team, platform-level, not scoped to any restaurant. Separate from `restaurant_staff` the same way `restaurant_staff` is separate from `users`: this grants elevated cross-restaurant access on top of an existing `users` identity, it isn't itself a login. A user can be both a platform admin and restaurant staff somewhere (e.g. piloting their own test restaurant) — not mutually exclusive, no constraint links the two.
+
+```sql
+CREATE TABLE platform_admins (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+  granted_by_user_id UUID REFERENCES users(id) ON DELETE SET NULL,  -- accountability (PAM, Part 7); NULL for the first-ever admin
+
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_platform_admins_user ON platform_admins(user_id);
+```
+
+Implementation: `backend/src/middleware/authorizePlatform.js`'s `requirePlatformAdmin(permissionKey)` — the System Admin counterpart to `authorize()` (table 2's notes / `SNAPORDER_AUTHORIZATION.md` Part 4). Verified live (denied, then allowed after inserting a row) in isolation — **no real route uses it yet**, since no platform-level resource (cross-restaurant analytics, roadmap status) exists to protect.
+
+---
+
 ## Relationships Summary
 
 ```
 users ──── restaurant_staff (1:M)  (a user can be staff at more than one restaurant)
+users ──── platform_admins (1:1, optional)
 
 restaurants
   ├─ restaurant_staff (1:M)
   │  └─ shifts (1:M)
   ├─ tables (1:M)
+  │  └─ guest_sessions (1:M)
   ├─ menus (1:M)
   │  └─ meal_categories (1:M)
   │     └─ meals (1:M)
@@ -733,7 +801,7 @@ BEFORE DELETE DO ... (application-level trigger recommended)
 
 ---
 
-**Schema Version:** 1.4 — migration 002 added `users` (login identity) and moved `restaurant_staff.email`/credentials there, so one login can cover staff roles at multiple restaurants
+**Schema Version:** 1.5 — migrations 003-005: `restaurants` gained `latitude`/`longitude`/`max_guest_distance_meters` and `guest_sessions` for proximity-gated guest access (see `SNAPORDER_AUTHORIZATION.md` Part 2 condition 6); `platform_admins` for the System Admin role; `audit_log.restaurant_id` made nullable for platform-level (non-restaurant-scoped) audit entries
 **Last Updated:** Sept 17, 2025
 **Status:** Implemented — see `backend/database/migrations/001_initial_schema.sql` and `backend/database/migrate.js`
 **Database:** PostgreSQL 13+ (running: postgres:15-alpine via docker-compose.yml, host port 5433)
