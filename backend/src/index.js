@@ -78,6 +78,46 @@ app.use('/v1/restaurants/:restaurantId/orders', restaurantOrderRoutes);
 // authenticate + authorize(). See routes/tables.js.
 app.use('/v1/restaurants/:restaurantId/tables', tableRoutes);
 
+// 404 for anything that didn't match a route above — must come after
+// every real route. Without this, an unmatched path (a typo, a
+// deprecated endpoint) falls through to Express's default HTML 404
+// page instead of this API's JSON error format.
+app.use((req, res) => {
+  res.status(404).json({ error: { code: 'NOT_FOUND', message: 'No such route' } });
+});
+
+// Centralized error handler — must be registered LAST, and must take
+// exactly 4 parameters (err, req, res, next); that arity is how Express
+// recognizes it as error-handling middleware rather than a normal one.
+//
+// Every route in this app already wraps its own logic in try/catch and
+// responds directly, so this isn't the primary path for "expected"
+// errors — it's the safety net for what those try/catches can't reach:
+// - express.json() rejecting a malformed or oversized body (it calls
+//   next(err) itself; without this handler that error falls through to
+//   Express's default HTML error page, not this API's JSON format).
+// - A route handler that throws synchronously outside its own
+//   try/catch, or a bug introduced later that forgets one.
+// - Any middleware (auth, rate limiting) that ever calls next(err)
+//   instead of responding directly.
+app.use((err, req, res, next) => {
+  if (res.headersSent) {
+    // A response is already underway — Express's own default handler
+    // is the correct thing to delegate to here, not another res.json().
+    return next(err);
+  }
+
+  if (err.type === 'entity.parse.failed') {
+    return res.status(400).json({ error: { code: 'INVALID_REQUEST', message: 'Malformed JSON body' } });
+  }
+  if (err.type === 'entity.too.large') {
+    return res.status(413).json({ error: { code: 'INVALID_REQUEST', message: 'Request body too large' } });
+  }
+
+  console.error('Unhandled error:', err);
+  res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Something went wrong' } });
+});
+
 async function start() {
   // Fail loudly before accepting any traffic if the schema can't be
   // brought up to date, rather than serving requests against a database
