@@ -230,48 +230,47 @@ ALTER TABLE order_items
 
 ---
 
-## Part 4: Enforcement Pattern (API layer)
+## Part 4: Enforcement Pattern (API layer) — implemented
 
-Every protected endpoint composes two middlewares: `authenticate` (verifies the JWT and loads the requester) and `authorize` (checks RBAC + relevant ABAC conditions for that specific route).
+Every protected endpoint composes two middlewares: `authenticate` (verifies the JWT and loads the requester — `backend/src/middleware/auth.js`) and `authorize` (checks RBAC + ABAC for that specific route — `backend/src/middleware/authorize.js`). **Both are real as of 2026-09-17.**
 
-**`authenticate` is real** — `backend/src/middleware/auth.js`, applied via `app.get('/v1/me', authenticate, ...)` as a working example in `backend/src/index.js`. It differs slightly from the original illustrative version below in one deliberate way: instead of trusting the raw JWT payload as `req.user`, it re-queries the `users` table by `payload.sub` and attaches *that* row — so a deleted account stops authenticating immediately, not just once its token happens to expire (Part 0).
-
-**`authorize` is still illustrative — not yet implemented.** This is the gap: `authenticate` establishes *who* is asking, but nothing yet checks the permission matrix (Part 1) or ABAC conditions (Part 2) against that identity for a specific route. Right now, any authenticated user could call any route that only has `authenticate` on it, with no role or ownership check at all.
+`authorize`'s built-in ownership check works a little differently from the original illustrative version below, in a way worth calling out: rather than comparing `actor.restaurant_id` to the route's `:restaurantId` as a separate ABAC step, the restaurant-scoped lookup itself (`SELECT ... FROM restaurant_staff WHERE user_id = $1 AND restaurant_id = $2`) *is* the ownership check — it's structurally impossible to get a matching row back for a restaurant you're not staff at, so there's nothing separate to remember to compare. The permission matrix (Part 1) is transcribed as data in `backend/src/authorization/permissions.js`, and `restaurant_staff.is_active` is re-checked on every call (closing the gap noted in Part 0).
 
 ```javascript
-// authenticate: real, see backend/src/middleware/auth.js
-// authorize: illustrative — not yet implemented.
+// backend/src/authorization/permissions.js
+export function roleGrants(role, permissionKey) { /* looks up the matrix */ }
 
-function authorize(permission, { abac } = {}) {
+// backend/src/middleware/authorize.js
+export function authorize(permissionKey, options = {}) {
+  const { restaurantIdParam = 'restaurantId', abac } = options;
   return async (req, res, next) => {
-    const actor = await loadActor(req.user.sub); // staff row or guest profile
-    if (!roleGrants(actor.role, permission)) {
-      return res.status(403).json({ error: { code: 'FORBIDDEN', message: `Role '${actor.role}' cannot '${permission}'` } });
-    }
-    if (abac && !(await abac(actor, req))) {
-      return res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Not allowed for this resource/state' } });
-    }
-    req.actor = actor;
+    const restaurantId = req.params[restaurantIdParam];
+    const { rows: [staff] } = await pool.query(
+      `SELECT id, restaurant_id, role, is_active, name FROM restaurant_staff WHERE user_id = $1 AND restaurant_id = $2`,
+      [req.user.id, restaurantId]
+    );
+    if (!staff) return deny('You have no role at this restaurant');       // ownership
+    if (!staff.is_active) return deny('...has been deactivated');        // deprovisioning
+    if (!roleGrants(staff.role, permissionKey)) return deny(`Role '${staff.role}' cannot '${permissionKey}'`); // RBAC
+    if (abac && !(await abac(staff, req))) return deny('Not allowed for this resource or in its current state'); // extra ABAC
+    req.actor = staff;
     next();
   };
 }
 
-// Example route:
-app.put(
-  '/v1/restaurants/:restaurantId/menus/:menuId/meals/:mealId',
-  authenticate,
-  authorize('edit_menu', {
-    abac: (actor, req) => actor.restaurant_id === req.params.restaurantId, // ownership check
-  }),
-  updateMealHandler
-);
+// Working example: backend/src/routes/staff.js
+app.use('/v1/restaurants/:restaurantId/staff', staffRoutes); // GET / -> authenticate, authorize('view_staff')
 ```
+
+Verified live against real data (register two restaurants, cross-restaurant access attempt, a role that lacks the permission, then that same role deactivated) — see the commit for the full sequence. Every one of the four denial paths (no role at this restaurant / deactivated / role lacks permission / extra ABAC condition failed) produces a distinct message and a distinct `audit_log` row (Part 5).
+
+**Still not built:** `authorize` only covers the four `restaurant_staff` roles (waiter/kitchen_staff/manager/owner) — see the scope note in `permissions.js`. `guest` actions (place an order, leave a review) and `system_admin` actions need their own enforcement path once those identities have real backing (guest session handling, and the `platform_admins` table respectively) — this doc's permission matrix already covers what they should be allowed, just not how to check it yet.
 
 ---
 
-## Part 5: Audit Trail
+## Part 5: Audit Trail — denials implemented
 
-Every DENIED authorization decision, and every state-changing ALLOWED one, should be recorded in the existing `audit_log` table (`SNAPORDER_DATABASE_SCHEMA.md`). No new table needed — this uses what's already there:
+Every DENIED authorization decision, and every state-changing ALLOWED one, should be recorded in the existing `audit_log` table (`SNAPORDER_DATABASE_SCHEMA.md`). No new table needed — this uses what's already there. **Denials are implemented:** every `authorize()` rejection writes a row via `backend/src/audit.js`'s `logAudit()` (actor, restaurant, the permission checked, why it failed, the request path) — verified live, see Part 4. **Allowed-action logging for specific sensitive operations (a refund, a staff removal) is not automatic** — `logAudit()` is exported for any route handler that wants to call it explicitly; none do yet, since none of those routes exist.
 
 ```sql
 INSERT INTO audit_log (restaurant_id, action, actor_type, actor_id, resource_type, resource_id, changes, ip_address)
@@ -305,15 +304,15 @@ A leaked Waiter token exposes one restaurant's order queue. A leaked System Admi
 
 ## Part 6: Not Yet Built (explicitly out of scope for this doc)
 
-- `platform_admins` table for System Admin role (currently no schema for platform-level staff — see Part 1 note).
-- `backend/src/authorization/permissions.js` (the permission matrix from Part 1, as code) and the `authorize` middleware shown in Part 4 — `authenticate` is now built (Part 0), `authorize` is still illustrative only. This means no route anywhere actually enforces a role or ABAC check yet.
-- Adding staff (Waiter/Kitchen Staff/Manager) to an *existing* restaurant — `POST /v1/auth/register` only covers onboarding a brand-new restaurant + its Owner (Part 0). There's no route yet for an Owner/Manager to add other staff to a restaurant that already exists.
-- Re-checking `restaurant_staff.is_active` on every authenticated request (Part 0) — `authenticate` now re-checks that the `users` row itself still exists, but not per-restaurant `is_active`, since that's role/restaurant-scoped and belongs to the still-unbuilt `authorize` layer.
+- `platform_admins` table for System Admin role (currently no schema for platform-level staff — see Part 1 note). Also means `authorize()` cannot grant any `system_admin`-only permission yet — there's no way to check whether a user is one.
+- Guest-side enforcement (place order, request ingredient removal, leave/edit review, vote on a suggestion) — `authorize()` only covers the four `restaurant_staff` roles. Guests aren't authenticated via `users`/JWT at all (phone-only, see Part 0), so they need a different enforcement mechanism, not an extension of this one.
+- Adding staff (Waiter/Kitchen Staff/Manager) to an *existing* restaurant — `POST /v1/auth/register` only covers onboarding a brand-new restaurant + its Owner (Part 0). There's no route yet for an Owner/Manager to add other staff to a restaurant that already exists. (The `authorize()` end-to-end test had to insert a staff row directly via SQL for exactly this reason.)
+- Almost every actual resource route the permission matrix (Part 1) covers — menu, inventory, orders, kitchen, payment, analytics. `GET /v1/restaurants/:restaurantId/staff` (`view_staff`) is the only one wired up so far, built specifically to prove `authorize()` works end-to-end.
 - MFA implementation for Owner/System Admin (Part 7) — no TOTP flow exists yet.
 - Just-in-time elevation and break-glass workflow for System Admin (Part 7) — currently only specified as a requirement, not designed in detail.
 
 ---
 
-**Doc version:** 1.3 — `authenticate` implemented (`backend/src/middleware/auth.js`), register/login routes implemented against the new `users`/`restaurant_staff` split (`backend/src/routes/auth.js`), Part 4 and Part 0 updated to match; `authorize` (RBAC/ABAC enforcement) remains the main open gap
+**Doc version:** 1.4 — `authorize` implemented (`backend/src/middleware/authorize.js`, `backend/src/authorization/permissions.js`), audit logging for denials implemented (`backend/src/audit.js`), Parts 4–5 rewritten to match, first real protected route (`GET /v1/restaurants/:restaurantId/staff`) added and verified end-to-end
 **Status:** Design specification, ready for implementation
 **Related:** `SNAPORDER_DATABASE_SCHEMA.md` (schema this model extends), `SNAPORDER_API_CONTRACTS.md` (endpoints this protects), `backend/src/auth.js` (JWT layer this builds on)

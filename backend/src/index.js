@@ -5,6 +5,7 @@ import { generalLimiter, authLimiter } from './middleware/rateLimit.js';
 import { authenticate } from './middleware/auth.js';
 import { initDb } from './init-db.js';
 import authRoutes from './routes/auth.js';
+import staffRoutes from './routes/staff.js';
 
 dotenv.config();
 
@@ -41,6 +42,9 @@ app.use('/v1/auth', authLimiter, authRoutes);
 app.get('/v1/me', authenticate, (req, res) => {
   res.json({ user: req.user });
 });
+
+// First real use of authorize() — see routes/staff.js.
+app.use('/v1/restaurants/:restaurantId/staff', staffRoutes);
 
 async function start() {
   // Fail loudly before accepting any traffic if the schema can't be

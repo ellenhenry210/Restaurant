@@ -414,6 +414,34 @@ Toggle meal availability (quick restaurant action).
 
 ---
 
+## Staff Management
+
+Implemented (as of 2026-09-17): `GET /v1/restaurants/{restaurantId}/staff` — `backend/src/routes/staff.js`. First real route behind `authorize()` (`SNAPORDER_AUTHORIZATION.md` Part 4) — the rest of this section's permission matrix (`edit_menu`, `issue_refund`, etc.) is designed but not wired to routes yet.
+
+### GET `/v1/restaurants/{restaurantId}/staff`
+List a restaurant's staff. Requires the `view_staff` permission (Manager/Owner/System Admin — see the RBAC matrix) **at this specific restaurant** — a token that's valid for a different restaurant gets `403`, not `404`, since the caller is authenticated, just not authorized for this resource.
+
+**Headers:** `Authorization: Bearer <access_token>`
+
+**Response (200):**
+```json
+{
+  "data": [
+    { "id": "uuid", "name": "Ada Okafor", "role": "owner", "is_active": true, "created_at": "2026-09-17T12:58:14.604Z" }
+  ]
+}
+```
+
+**Response (403)** — one of several distinct reasons, each also written to `audit_log`:
+```json
+{ "error": { "code": "FORBIDDEN", "message": "You have no role at this restaurant" } }
+```
+or `"Role 'waiter' cannot 'view_staff'"`, or `"Your access to this restaurant has been deactivated"`.
+
+**Response (400)** if `restaurantId` isn't a valid UUID; **401** if the token is missing/invalid (from `authenticate`, before `authorize` even runs).
+
+---
+
 ## Guest Health Profiles
 
 ### POST `/guest-profiles`
@@ -709,7 +737,7 @@ Rate-limit state is in-memory (the library's default store) — correct for a si
 
 ---
 
-**API Version:** 1.2 — Authentication Endpoints rewritten to match the actual implementation: routes now live under `/v1/auth`, `owner_name` added to register, `restaurant_id` added to login's user object, no `refresh_token` (not built), added `GET /v1/me`
+**API Version:** 1.3 — added Staff Management section (`GET /v1/restaurants/{restaurantId}/staff`), the first route enforced by `authorize()`
 **Last Updated:** Sept 17, 2026  
 **Status:** Ready for implementation  
 **Protocol:** REST with WebSocket for KDS
