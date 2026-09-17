@@ -25,7 +25,7 @@ const BCRYPT_SALT_ROUNDS = 12;
 router.get('/', authenticate, authorize('view_staff'), async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT id, name, role, is_active, created_at
+      `SELECT id, name, display_name, role, is_active, created_at
        FROM restaurant_staff
        WHERE restaurant_id = $1
        ORDER BY created_at ASC`,
@@ -52,7 +52,7 @@ router.get('/', authenticate, authorize('view_staff'), async (req, res) => {
 // login they already have, without a separate password to manage.
 // ---------------------------------------------------------------------
 router.post('/', authenticate, authorize('manage_staff'), async (req, res) => {
-  const { email, name, role, password, phone } = req.body ?? {};
+  const { email, name, display_name: displayName, role, password, phone } = req.body ?? {};
 
   const errors = [];
   if (!email || typeof email !== 'string' || !EMAIL_RE.test(email)) {
@@ -99,10 +99,10 @@ router.post('/', authenticate, authorize('manage_staff'), async (req, res) => {
     }
 
     const staffResult = await client.query(
-      `INSERT INTO restaurant_staff (restaurant_id, user_id, name, role, phone)
-       VALUES ($1, $2, $3, $4, $5)
-       RETURNING id, name, role, phone, is_active, created_at`,
-      [req.params.restaurantId, userId, name, role, phone ?? null]
+      `INSERT INTO restaurant_staff (restaurant_id, user_id, name, display_name, role, phone)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       RETURNING id, name, display_name, role, phone, is_active, created_at`,
+      [req.params.restaurantId, userId, name, displayName ?? null, role, phone ?? null]
     );
 
     await client.query('COMMIT');
@@ -116,6 +116,43 @@ router.post('/', authenticate, authorize('manage_staff'), async (req, res) => {
     res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Failed to add staff' } });
   } finally {
     client.release();
+  }
+});
+
+// ---------------------------------------------------------------------
+// PATCH /:staffId — update a staff member's display_name. "Customizable"
+// implies editable, not just set once at creation. Gated by manage_staff
+// like the rest of this file, not left open for self-service editing —
+// there's no "edit my own profile" route/concept yet (would need its
+// own identity check: req.user.id maps to which restaurant_staff row),
+// so for now only an Owner/System Admin can change it.
+// ---------------------------------------------------------------------
+router.patch('/:staffId', authenticate, authorize('manage_staff'), async (req, res) => {
+  const { display_name: displayName } = req.body ?? {};
+
+  if (displayName !== null && typeof displayName !== 'string') {
+    return res.status(400).json({
+      error: { code: 'INVALID_REQUEST', message: 'display_name must be a string, or null to clear it' },
+    });
+  }
+
+  try {
+    const result = await pool.query(
+      `UPDATE restaurant_staff
+       SET display_name = $1, updated_at = CURRENT_TIMESTAMP
+       WHERE id = $2 AND restaurant_id = $3
+       RETURNING id, name, display_name, role, is_active`,
+      [displayName ?? null, req.params.staffId, req.params.restaurantId]
+    );
+
+    if (!result.rows[0]) {
+      return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Staff member not found' } });
+    }
+
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('PATCH /staff/:staffId: failed:', err.message);
+    res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Failed to update staff member' } });
   }
 });
 

@@ -11,6 +11,7 @@ import restaurantRoutes from './routes/restaurants.js';
 import menuRoutes from './routes/menus.js';
 import orderRoutes from './routes/orders.js';
 import restaurantOrderRoutes from './routes/restaurantOrders.js';
+import tableRoutes from './routes/tables.js';
 
 dotenv.config();
 
@@ -72,6 +73,10 @@ app.use('/v1/orders', orderRoutes);
 // Staff/kitchen side of order management — behind authenticate +
 // authorize(). See routes/restaurantOrders.js.
 app.use('/v1/restaurants/:restaurantId/orders', restaurantOrderRoutes);
+
+// Table-to-staff assignment ("who's serving this table") — behind
+// authenticate + authorize(). See routes/tables.js.
+app.use('/v1/restaurants/:restaurantId/tables', tableRoutes);
 
 async function start() {
   // Fail loudly before accepting any traffic if the schema can't be

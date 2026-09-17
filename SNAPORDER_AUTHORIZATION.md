@@ -108,6 +108,7 @@ Note on a schema change from the original draft: the earlier `restaurant_staff.r
 | **Staff** — assign shifts | ➖ | ➖ | ➖ | ✅ | ✅ | ✅ |
 | **Staff** — hire/remove staff | ➖ | ➖ | ➖ | ➖ | ✅ | ✅ |
 | **Staff** — view individual performance | ➖ | ➖ | ➖ | ✅ | ✅ | ✅ |
+| **Staff** — assign a table to a server (`assign_table`, added 2026-09-17) | ➖ | ➖ | ➖ | ✅ | ✅ | ✅ |
 | **Feedback** — leave a review | ✅ (own completed order) | ➖ | ➖ | ➖ | ➖ | ➖ |
 | **Feedback** — edit own review | ✅ (within 48h) | ➖ | ➖ | ➖ | ➖ | ➖ |
 | **Feedback** — reply to a review publicly | ➖ | ➖ | ➖ | ✅ | ✅ | ✅ |
@@ -115,7 +116,7 @@ Note on a schema change from the original draft: the earlier `restaurant_staff.r
 | **Feedback** — approve/remove a review (abuse, spam) | ➖ | ➖ | ➖ | ➖ | ✅ | ✅ |
 | **Suggestions** — set roadmap status (planned/in progress/done) | ➖ | ➖ | ➖ | ➖ | ➖ | ✅ |
 
-This matrix lives as a static constant in application code (`backend/src/authorization/permissions.js`, to be created), not a database table — consistent with starting as a modular monolith rather than building a dynamic permissions engine before there's a proven need for restaurants to customize roles themselves.
+This matrix lives as a static constant in application code (`backend/src/authorization/permissions.js`), not a database table — consistent with starting as a modular monolith rather than building a dynamic permissions engine before there's a proven need for restaurants to customize roles themselves. `assign_table` is the first permission added to this matrix after the fact (2026-09-17) rather than being part of the original design — an explicit user request ("the guest should know the staff that is assigned to serving them"), given the same role set as the closely related `assign_shifts` since it's the same kind of day-to-day scheduling decision.
 
 ---
 
@@ -328,6 +329,6 @@ A leaked Waiter token exposes one restaurant's order queue. A leaked System Admi
 
 ---
 
-**Doc version:** 1.6 — `manage_staff` (add staff to existing restaurant), `view_all_orders`/`modify_order`/`update_kitchen_item_status` (staff/kitchen order management) all implemented and verified live; Part 6 updated to match
+**Doc version:** 1.7 — added `assign_table` permission (Part 1) and its implementation (`backend/src/routes/tables.js`, `table_assignments`), the first permission added to the matrix after the fact rather than part of the original design
 **Status:** Design specification, ready for implementation
 **Related:** `SNAPORDER_DATABASE_SCHEMA.md` (schema this model extends), `SNAPORDER_API_CONTRACTS.md` (endpoints this protects), `backend/src/auth.js` (JWT layer this builds on)

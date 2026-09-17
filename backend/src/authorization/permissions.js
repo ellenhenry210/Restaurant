@@ -69,6 +69,13 @@ const PERMISSIONS = [
   { key: 'assign_shifts', roles: ['manager', 'owner', 'system_admin'] },
   { key: 'manage_staff', roles: ['owner', 'system_admin'] }, // hire/remove
   { key: 'view_staff_performance', roles: ['manager', 'owner', 'system_admin'] },
+  // Not in the original Part 1 matrix — added 2026-09-17 alongside the
+  // table_assignments feature (an explicit user request). Same role set
+  // as assign_shifts: assigning a table to a server is the same kind of
+  // day-to-day scheduling decision as assigning a shift, so it's a
+  // Manager-level action, not something a Waiter or Kitchen Staff
+  // member grants themselves.
+  { key: 'assign_table', roles: ['manager', 'owner', 'system_admin'] },
 
   // Feedback
   { key: 'leave_review', roles: ['guest'] },

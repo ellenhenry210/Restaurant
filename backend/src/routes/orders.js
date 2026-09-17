@@ -293,15 +293,31 @@ router.get('/:id', authenticateGuest, async (req, res) => {
     }
     order.grand_total = Number(order.total_amount) + Number(order.tip_amount);
 
-    const itemsResult = await pool.query(
-      `SELECT id, meal_id, meal_name, meal_price, quantity, status, special_request
-       FROM order_items
-       WHERE order_id = $1
-       ORDER BY created_at ASC`,
-      [order.id]
-    );
+    const [itemsResult, staffResult] = await Promise.all([
+      pool.query(
+        `SELECT id, meal_id, meal_name, meal_price, quantity, status, special_request
+         FROM order_items
+         WHERE order_id = $1
+         ORDER BY created_at ASC`,
+        [order.id]
+      ),
+      // Same "who's serving this table" lookup as GET /guest/session —
+      // checking on an order is exactly when a guest would want to know.
+      pool.query(
+        `SELECT rs.name, rs.display_name, rs.role
+         FROM table_assignments ta
+         JOIN restaurant_staff rs ON rs.id = ta.staff_id
+         WHERE ta.table_id = $1 AND ta.unassigned_at IS NULL`,
+        [order.table_id]
+      ),
+    ]);
 
-    res.json({ ...order, items: itemsResult.rows });
+    const staff = staffResult.rows[0];
+    res.json({
+      ...order,
+      server: staff ? { name: staff.display_name ?? staff.name, role: staff.role } : null,
+      items: itemsResult.rows,
+    });
   } catch (err) {
     if (err.code === '22P02') {
       return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Order not found' } });

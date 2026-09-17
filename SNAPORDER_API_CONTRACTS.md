@@ -175,9 +175,11 @@ or `"This restaurant has not configured its location yet — guest ordering is u
 {
   "session": { "id": "uuid", "table_id": "uuid", "restaurant_id": "uuid", "guest_profile_id": null, "expires_at": "2026-09-17T18:09:19.000Z" },
   "restaurant_name": "Geo Test Diner",
-  "table_number": 1
+  "table_number": 1,
+  "server": { "name": "Wendy", "role": "waiter" }
 }
 ```
+`server` (added 2026-09-17, explicit user request: "the guest should know the staff that is assigned to serving them") is whoever's currently assigned to this table via `POST /v1/restaurants/{restaurantId}/tables/{tableId}/assign` (see Table Assignment below), or `null` if nobody is. `name` here is `display_name` when the staff member has set one, else their full `name` — see Staff Management for `display_name`.
 
 **Response (401)** if the token is missing, expired, not a guest-type token (e.g. a staff token was used here by mistake), or the session no longer exists — including if it was revoked early (`guest_sessions.expires_at` set into the past), even though the JWT itself hasn't naturally expired yet.
 
@@ -333,6 +335,7 @@ Get order status. Ownership is table-based: the order's `table_id` must match th
   "total_amount": "6600.00",
   "tip_amount": "300.00",
   "grand_total": 6900,
+  "server": { "name": "Wendy", "role": "waiter" },
   "items": [
     { "id": "item_uuid", "meal_name": "Grilled Chicken Rice", "quantity": 2, "status": "pending", "special_request": "Extra spicy" }
   ]
@@ -455,10 +458,11 @@ List a restaurant's staff. Requires the `view_staff` permission (Manager/Owner/S
 ```json
 {
   "data": [
-    { "id": "uuid", "name": "Ada Okafor", "role": "owner", "is_active": true, "created_at": "2026-09-17T12:58:14.604Z" }
+    { "id": "uuid", "name": "Ada Okafor", "display_name": null, "role": "owner", "is_active": true, "created_at": "2026-09-17T12:58:14.604Z" }
   ]
 }
 ```
+`display_name` (added 2026-09-17) is the customizable, guest-facing name a staff member can go by — `null` until set, in which case `name` is shown to guests instead (see Guest Session's `server` field).
 
 **Response (403)** — one of several distinct reasons, each also written to `audit_log`:
 ```json
@@ -473,18 +477,48 @@ Add staff to a restaurant that **already exists** — the other half of a gap fl
 
 **Request (new person, no existing account):**
 ```json
-{ "email": "waiter@example.ng", "name": "Wendy Waiter", "role": "waiter", "password": "SecurePass123", "phone": "+234..." }
+{ "email": "waiter@example.ng", "name": "Wendy Waiter", "display_name": "Wendy", "role": "waiter", "password": "SecurePass123", "phone": "+234..." }
 ```
 **Request (person already has a `users` account — e.g. also staff at another restaurant):**
 ```json
 { "email": "existing@example.ng", "name": "Their name here", "role": "manager" }
 ```
-`role` must be one of `waiter`, `kitchen_staff`, `manager`, `owner`. Omit `password` entirely when the email already has an account — reuses that login rather than creating a second one (the whole point of the `users`/`restaurant_staff` split, `SNAPORDER_DATABASE_SCHEMA.md` table 19: one person, one login, potentially many restaurants).
+`role` must be one of `waiter`, `kitchen_staff`, `manager`, `owner`. `display_name` is optional. Omit `password` entirely when the email already has an account — reuses that login rather than creating a second one (the whole point of the `users`/`restaurant_staff` split, `SNAPORDER_DATABASE_SCHEMA.md` table 19: one person, one login, potentially many restaurants) — verified live that the same login ends up staff at two different restaurants with different roles at each.
 
-**Response (201):** `{ "id": "uuid", "name": "Wendy Waiter", "role": "waiter", "phone": null, "is_active": true, "created_at": "..." }`
+**Response (201):** `{ "id": "uuid", "name": "Wendy Waiter", "display_name": "Wendy", "role": "waiter", "phone": null, "is_active": true, "created_at": "..." }`
 
 **Response (400)** — `password` provided for an email that already has an account (rejected explicitly rather than silently ignored, so the caller can't mistakenly believe they changed someone else's password), missing `password` for a genuinely new account, or an invalid `role`.
 **Response (409)** `"This person is already staff at this restaurant"` if that `user_id`+`restaurant_id` pairing already exists.
+
+### PATCH `/v1/restaurants/{restaurantId}/staff/{staffId}`
+Update a staff member's `display_name` — "customizable" implies editable, not just set once. Requires `manage_staff` (same as adding staff — there's no self-service "edit my own profile" route yet).
+
+**Request:** `{ "display_name": "Wendy O." }` (or `{ "display_name": null }` to clear it back to showing `name`)
+
+**Response (200):** `{ "id": "uuid", "name": "Wendy Waiter", "display_name": "Wendy O.", "role": "waiter", "is_active": true }`
+**Response (404)** if the staff member isn't at this restaurant.
+
+---
+
+## Table Assignment
+
+Implemented (2026-09-17) — `backend/src/routes/tables.js`, mounted at `/v1/restaurants/{restaurantId}/tables`. Explicit user request: "the guest should know the staff that is assigned to serving them." Both endpoints require `assign_table` (Manager/Owner/System Admin).
+
+### POST `/v1/restaurants/{restaurantId}/tables/{tableId}/assign`
+Assign a staff member to serve a table. Reassigning an already-assigned table ends the previous assignment and starts the new one atomically — a manager moving tables between servers mid-shift is one call, not an unassign-then-assign pair.
+
+**Request:** `{ "staff_id": "uuid" }` — must be active staff at this same restaurant.
+
+**Response (201):**
+```json
+{ "id": "assignment_uuid", "table_id": "uuid", "assigned_at": "2026-09-17T17:36:39.566Z", "staff": { "id": "uuid", "name": "Wendy", "role": "waiter" } }
+```
+**Response (400)** if `staff_id` isn't active staff at this restaurant. **Response (404)** if the table isn't at this restaurant.
+
+### POST `/v1/restaurants/{restaurantId}/tables/{tableId}/unassign`
+End the current assignment, if any — not an error if there wasn't one.
+
+**Response (200):** `{ "table_id": "uuid", "was_assigned": true }`
 
 ---
 
@@ -783,7 +817,7 @@ Rate-limit state is in-memory (the library's default store) — correct for a si
 
 ---
 
-**API Version:** 1.6 — tax/service charge/tip now computed (was flagged unimplemented); added Order Management (Staff/Kitchen) section (`GET`/`PATCH` order and item status, real state-machine validated); added `POST /v1/restaurants/{restaurantId}/staff`
+**API Version:** 1.7 — added Table Assignment section (assign/unassign); added `display_name` (customizable staff name) and `server` (who's serving this table, on Guest Session and Order Status) — both from an explicit user request
 **Last Updated:** Sept 17, 2026  
 **Status:** Ready for implementation  
 **Protocol:** REST with WebSocket for KDS

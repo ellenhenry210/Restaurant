@@ -123,15 +123,34 @@ router.post('/tables/:qrCodeId/scan', async (req, res) => {
 // ---------------------------------------------------------------------
 router.get('/guest/session', authenticateGuest, async (req, res) => {
   try {
-    const result = await pool.query(
-      `SELECT r.name AS restaurant_name, t.table_number
-       FROM guest_sessions gs
-       JOIN restaurants r ON r.id = gs.restaurant_id
-       JOIN tables t ON t.id = gs.table_id
-       WHERE gs.id = $1`,
-      [req.guestSession.id]
-    );
-    res.json({ session: req.guestSession, ...result.rows[0] });
+    const [sessionResult, staffResult] = await Promise.all([
+      pool.query(
+        `SELECT r.name AS restaurant_name, t.table_number
+         FROM guest_sessions gs
+         JOIN restaurants r ON r.id = gs.restaurant_id
+         JOIN tables t ON t.id = gs.table_id
+         WHERE gs.id = $1`,
+        [req.guestSession.id]
+      ),
+      // Who's currently serving this table — "the guest should know the
+      // staff that is assigned to serving them" (explicit user request).
+      // display_name (customizable, guest-facing) is preferred over the
+      // required legal `name` when set.
+      pool.query(
+        `SELECT rs.name, rs.display_name, rs.role
+         FROM table_assignments ta
+         JOIN restaurant_staff rs ON rs.id = ta.staff_id
+         WHERE ta.table_id = $1 AND ta.unassigned_at IS NULL`,
+        [req.guestSession.table_id]
+      ),
+    ]);
+
+    const staff = staffResult.rows[0];
+    res.json({
+      session: req.guestSession,
+      ...sessionResult.rows[0],
+      server: staff ? { name: staff.display_name ?? staff.name, role: staff.role } : null,
+    });
   } catch (err) {
     console.error('GET /guest/session: failed:', err.message);
     res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Failed to load session' } });

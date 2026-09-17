@@ -91,6 +91,12 @@ CREATE TABLE restaurant_staff (
   user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   
   name VARCHAR(255) NOT NULL,
+  -- Customizable, guest-facing name (migration 009, 2026-09-17) —
+  -- explicit user request: "I want the name to be customizable as well."
+  -- NULL means "just show `name`"; a staff member isn't forced to set
+  -- one. Shown to guests via table_assignments (table 22), never `name`
+  -- directly once display_name is set.
+  display_name VARCHAR(255),
   phone VARCHAR(20),
   
   role ENUM('waiter', 'kitchen_staff', 'manager', 'owner') NOT NULL,
@@ -733,6 +739,34 @@ Implementation: `backend/src/middleware/authorizePlatform.js`'s `requirePlatform
 
 ---
 
+### 22. `table_assignments`
+Which staff member is currently serving a table (migration 009, 2026-09-17) — explicit user request: "the guest should know the staff that is assigned to serving them." Its own table with history, not a single column overwritten on `tables`, for the same reason `shifts` (table 18) isn't just a flag on `restaurant_staff` — who served a table, and when, is worth keeping.
+
+```sql
+CREATE TABLE table_assignments (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  table_id UUID NOT NULL REFERENCES tables(id) ON DELETE CASCADE,
+  staff_id UUID NOT NULL REFERENCES restaurant_staff(id) ON DELETE CASCADE,
+
+  assigned_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  unassigned_at TIMESTAMP,  -- NULL = currently assigned
+
+  CONSTRAINT chk_assignment_times CHECK (unassigned_at IS NULL OR unassigned_at > assigned_at)
+);
+
+CREATE INDEX idx_assignments_staff ON table_assignments(staff_id);
+CREATE INDEX idx_assignments_table_active ON table_assignments(table_id) WHERE unassigned_at IS NULL;
+
+-- One active assignment per table — reassigning ends the previous one
+-- first (backend/src/routes/tables.js), atomically, rather than
+-- requiring a separate unassign call.
+CREATE UNIQUE INDEX unique_active_assignment_per_table ON table_assignments(table_id) WHERE unassigned_at IS NULL;
+```
+
+Implementation: `backend/src/routes/tables.js` (`POST /:tableId/assign`, `POST /:tableId/unassign`, both requiring the `assign_table` permission — Manager/Owner/System Admin). Surfaced to guests via `GET /v1/guest/session` and `GET /v1/orders/:id` (both return a `server: { name, role }` field, preferring `restaurant_staff.display_name` over `name` when set) — verified live, including that reassigning a table correctly updates what a guest sees on their very next request.
+
+---
+
 ## Relationships Summary
 
 ```
@@ -741,7 +775,8 @@ users ──── platform_admins (1:1, optional)
 
 restaurants
   ├─ restaurant_staff (1:M)
-  │  └─ shifts (1:M)
+  │  ├─ shifts (1:M)
+  │  └─ table_assignments (1:M) ──── tables
   ├─ tables (1:M)
   │  └─ guest_sessions (1:M)
   ├─ menus (1:M)
@@ -816,7 +851,7 @@ BEFORE DELETE DO ... (application-level trigger recommended)
 
 ---
 
-**Schema Version:** 1.7 — migration 008 added `restaurants.tax_rate`/`service_charge_rate`, now actually applied at order creation (was previously flagged as unimplemented)
+**Schema Version:** 1.8 — migration 009 added `restaurant_staff.display_name` (customizable guest-facing name) and `table_assignments` (which staff member is serving a table, with history) — both from an explicit user request
 **Last Updated:** Sept 17, 2025
 **Status:** Implemented — see `backend/database/migrations/001_initial_schema.sql` and `backend/database/migrate.js`
 **Database:** PostgreSQL 13+ (running: postgres:15-alpine via docker-compose.yml, host port 5433)
