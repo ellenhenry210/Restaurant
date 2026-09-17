@@ -10,7 +10,14 @@ services:
       POSTGRES_USER: snaporder_user
       POSTGRES_PASSWORD: changeme_in_local_env
     ports:
-      - "5432:5432"
+      # Host port 5433, not 5432: a native Windows Postgres service is
+      # already bound to 5432 on this machine, and localhost connections
+      # were silently landing on that one instead of this container
+      # (different credentials -> confusing auth failures). Container-
+      # internal port stays 5432; only the host-side mapping changes, so
+      # nothing inside the container/network needs updating, just DB_PORT
+      # in .env / .env.example to match.
+      - "5433:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
