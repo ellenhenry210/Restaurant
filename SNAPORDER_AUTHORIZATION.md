@@ -29,20 +29,25 @@ Authentication answers "is this really who they claim to be?" RBAC answers "does
 
 RBAC/ABAC/PAM (Parts 1, 2, 7) are the *access-control* layer of IAM. IAM itself is broader — it also owns how an identity comes to exist, how it proves itself, and how it's retired.
 
+### Identity, as actually implemented (2026-09-17)
+
+Identity (`users`) and role assignment (`restaurant_staff`) are separate tables, not one — see `SNAPORDER_DATABASE_SCHEMA.md` tables 2 and 19. This is what makes the "Owner (or several, if multi-location)" scope note in Part 1's role table real rather than aspirational: one `users` row (one login) can have multiple `restaurant_staff` rows, one per restaurant they have a role at.
+
 ### Identity lifecycle
 
-| Stage | For staff (`restaurant_staff`) | For guests (`guest_profiles`) |
+| Stage | For staff (`users` + `restaurant_staff`) | For guests (`guest_profiles`) |
 |---|---|---|
-| **Provisioning** | Owner/Manager creates the staff row with a role (Part 1). No self-signup for staff. | Created automatically on first order (phone number as identifier) — deliberately low-friction, matching the "scan and order" UX. |
-| **Authentication** | Email + password login → JWT (`backend/src/auth.js`, already built). | Phone number / session token; no password — see `SNAPORDER_API_CONTRACTS.md` `X-Guest-Phone` header. |
-| **Role change** | Owner/Manager updates `restaurant_staff.role`. Every role change should be written to `audit_log`. | N/A — guests don't have roles. |
-| **Deprovisioning** | `restaurant_staff.is_active = false` on termination — revokes access immediately, not just at next login (tokens should be checked against `is_active` on each request, not just at issuance, so firing someone doesn't leave a 6h-valid token still working — see JWT_EXPIRY note below). | Guest identity naturally expires with inactivity; no formal offboarding needed since a phone number carries no standing privilege. |
+| **Provisioning** | `POST /v1/auth/register` creates a `users` row plus a `restaurant_staff` row with role `owner`, for onboarding a brand-new restaurant. There's no self-signup for any other role yet — adding a Waiter/Kitchen Staff/Manager to an *existing* restaurant (an Owner/Manager action, not public) isn't built. | Created automatically on first order (phone number as identifier) — deliberately low-friction, matching the "scan and order" UX. |
+| **Authentication** | `POST /v1/auth/login` → JWT, via `backend/src/routes/auth.js` + `backend/src/auth.js`. `backend/src/middleware/auth.js` (`authenticate`) verifies the token and re-loads the `users` row fresh on every request — see below. | Phone number / session token; no password — see `SNAPORDER_API_CONTRACTS.md` `X-Guest-Phone` header. |
+| **Role change** | Owner/Manager updates `restaurant_staff.role`. Every role change should be written to `audit_log`. Not yet built (no route for it). | N/A — guests don't have roles. |
+| **Deprovisioning** | `restaurant_staff.is_active = false` for that restaurant. **Partially closed:** `authenticate` re-checks that the `users` row still exists on every request (so a deleted account stops working immediately, not just at token expiry) — but it does NOT check `restaurant_staff.is_active`, since that's restaurant/role-scoped and `authenticate` deliberately doesn't know which restaurant a request concerns (see below). That check belongs to the still-unbuilt `authorize()` layer (Part 4). | Guest identity naturally expires with inactivity; no formal offboarding needed since a phone number carries no standing privilege. |
 
-### Authentication mechanics already built
+### Authentication mechanics — implemented
 
-`backend/src/auth.js` provides `generateToken`/`verifyToken` — this is the authentication half of IAM. Notes relevant to this doc:
-- Token lifetime (`JWT_EXPIRY`, currently `6h`) is the window between a deprovisioned account being disabled and their existing token actually stopping to work, *if* verification only checks the signature. To close that gap, `authorize` middleware (Part 4) should re-check `is_active` from the database on every request for staff, not just trust the token's claims — the token proves identity, not current standing.
-- Password storage: `bcryptjs` is already a backend dependency for this — staff passwords must be hashed (never stored/logged in plaintext), consistent with the **Integrity** value.
+- `backend/src/auth.js` — `generateToken`/`verifyToken`. Tokens are deliberately minimal (`{ sub: userId }` only) — no `role` or `restaurant_id` embedded, so a role change takes effect on the next request rather than only after the token expires.
+- `backend/src/routes/auth.js` — `POST /v1/auth/register`, `POST /v1/auth/login`. Login resolves the user's role/restaurant from `restaurant_staff` fresh at login time (not from the token).
+- `backend/src/middleware/auth.js` — `authenticate`. Verifies the JWT, then re-loads the `users` row from the database (not just trusting the token payload) and attaches it as `req.user`. This is authentication only — *who* the requester is — not authorization. A companion `authorize(permission)` middleware that checks role/restaurant-scoped permissions (Parts 1–2) against `req.user` is specified in Part 4 below but **not yet built** — right now, `authenticate` alone doesn't stop an authenticated user from any particular action; nothing enforces the permission matrix yet.
+- Password storage: `bcryptjs`, async `hash`/`compare` (cost 12) — never the sync variants, which would block the event loop for the ~100ms+ a hash takes.
 
 ---
 
@@ -227,22 +232,15 @@ ALTER TABLE order_items
 
 ## Part 4: Enforcement Pattern (API layer)
 
-Every protected endpoint composes two middlewares: authenticate (verifies the JWT — see `backend/src/auth.js`) and authorize (checks RBAC + relevant ABAC conditions for that specific route).
+Every protected endpoint composes two middlewares: `authenticate` (verifies the JWT and loads the requester) and `authorize` (checks RBAC + relevant ABAC conditions for that specific route).
+
+**`authenticate` is real** — `backend/src/middleware/auth.js`, applied via `app.get('/v1/me', authenticate, ...)` as a working example in `backend/src/index.js`. It differs slightly from the original illustrative version below in one deliberate way: instead of trusting the raw JWT payload as `req.user`, it re-queries the `users` table by `payload.sub` and attaches *that* row — so a deleted account stops authenticating immediately, not just once its token happens to expire (Part 0).
+
+**`authorize` is still illustrative — not yet implemented.** This is the gap: `authenticate` establishes *who* is asking, but nothing yet checks the permission matrix (Part 1) or ABAC conditions (Part 2) against that identity for a specific route. Right now, any authenticated user could call any route that only has `authenticate` on it, with no role or ownership check at all.
 
 ```javascript
-// Illustrative — not yet implemented.
-import { verifyToken } from './auth.js';
-
-function authenticate(req, res, next) {
-  const header = req.headers.authorization; // "Bearer <token>"
-  const token = header?.startsWith('Bearer ') ? header.slice(7) : null;
-  try {
-    req.user = verifyToken(token); // { sub, iat, exp }
-    next();
-  } catch {
-    res.status(401).json({ error: { code: 'UNAUTHORIZED', message: 'Missing or invalid token' } });
-  }
-}
+// authenticate: real, see backend/src/middleware/auth.js
+// authorize: illustrative — not yet implemented.
 
 function authorize(permission, { abac } = {}) {
   return async (req, res, next) => {
@@ -308,14 +306,14 @@ A leaked Waiter token exposes one restaurant's order queue. A leaked System Admi
 ## Part 6: Not Yet Built (explicitly out of scope for this doc)
 
 - `platform_admins` table for System Admin role (currently no schema for platform-level staff — see Part 1 note).
-- The actual `backend/src/authorization/permissions.js` matrix and `authenticate`/`authorize` middleware shown in Part 4 — this doc specifies them, doesn't implement them.
-- Migration to apply the `meal_ingredients`/`order_items` schema changes in Part 3.
+- `backend/src/authorization/permissions.js` (the permission matrix from Part 1, as code) and the `authorize` middleware shown in Part 4 — `authenticate` is now built (Part 0), `authorize` is still illustrative only. This means no route anywhere actually enforces a role or ABAC check yet.
+- Adding staff (Waiter/Kitchen Staff/Manager) to an *existing* restaurant — `POST /v1/auth/register` only covers onboarding a brand-new restaurant + its Owner (Part 0). There's no route yet for an Owner/Manager to add other staff to a restaurant that already exists.
+- Re-checking `restaurant_staff.is_active` on every authenticated request (Part 0) — `authenticate` now re-checks that the `users` row itself still exists, but not per-restaurant `is_active`, since that's role/restaurant-scoped and belongs to the still-unbuilt `authorize` layer.
 - MFA implementation for Owner/System Admin (Part 7) — no TOTP flow exists yet.
 - Just-in-time elevation and break-glass workflow for System Admin (Part 7) — currently only specified as a requirement, not designed in detail.
-- Re-checking `restaurant_staff.is_active` on every authenticated request rather than only at token issuance (Part 0) — needed so deprovisioning is immediate, not delayed until token expiry.
 
 ---
 
-**Doc version:** 1.2 — added `shifts` table backing for session-context ABAC (Part 2, condition 4)
+**Doc version:** 1.3 — `authenticate` implemented (`backend/src/middleware/auth.js`), register/login routes implemented against the new `users`/`restaurant_staff` split (`backend/src/routes/auth.js`), Part 4 and Part 0 updated to match; `authorize` (RBAC/ABAC enforcement) remains the main open gap
 **Status:** Design specification, ready for implementation
 **Related:** `SNAPORDER_DATABASE_SCHEMA.md` (schema this model extends), `SNAPORDER_API_CONTRACTS.md` (endpoints this protects), `backend/src/auth.js` (JWT layer this builds on)

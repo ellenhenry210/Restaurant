@@ -58,15 +58,15 @@ CREATE INDEX idx_restaurants_custom_domain ON restaurants(custom_domain);
 ---
 
 ### 2. `restaurant_staff`
-Staff members with roles. Role values and what each can do are the RBAC layer defined in `SNAPORDER_AUTHORIZATION.md` — see that doc for the full permission matrix and the ABAC conditions layered on top (e.g. `restaurant_id` ownership scoping applies to every query against this table and everything it relates to).
+Staff members with roles. Role values and what each can do are the RBAC layer defined in `SNAPORDER_AUTHORIZATION.md` — see that doc for the full permission matrix and the ABAC conditions layered on top (e.g. `restaurant_id` ownership scoping applies to every query against this table and everything it relates to). Login credentials live separately, on **table 19, `users`** — this table only holds a person's restaurant-scoped role assignment; see that section for why they're split.
 
 ```sql
 CREATE TABLE restaurant_staff (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   restaurant_id UUID NOT NULL REFERENCES restaurants(id) ON DELETE CASCADE,
+  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   
   name VARCHAR(255) NOT NULL,
-  email VARCHAR(255),
   phone VARCHAR(20),
   
   role ENUM('waiter', 'kitchen_staff', 'manager', 'owner') NOT NULL,
@@ -75,14 +75,17 @@ CREATE TABLE restaurant_staff (
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   
-  CONSTRAINT unique_restaurant_email UNIQUE (restaurant_id, email)
+  CONSTRAINT unique_user_per_restaurant UNIQUE (restaurant_id, user_id)
 );
 
 CREATE INDEX idx_staff_restaurant ON restaurant_staff(restaurant_id);
 CREATE INDEX idx_staff_role ON restaurant_staff(restaurant_id, role);
+CREATE INDEX idx_staff_user ON restaurant_staff(user_id);
 ```
 
-Note: this supersedes an earlier draft of this table that used `('manager', 'chef', 'waiter', 'inventory_manager')`. Renamed `chef` → `kitchen_staff` and folded `inventory_manager` into `manager` to match the 6-role platform-wide hierarchy in `SNAPORDER_AUTHORIZATION.md` (Guest → Waiter → Kitchen Staff → Manager → Owner → System Admin). System Admin is platform-level, not restaurant-scoped, so it belongs in a separate `platform_admins` table — not yet created (see Authorization doc, Part 6).
+Notes:
+- Supersedes an earlier draft of this table that used `('manager', 'chef', 'waiter', 'inventory_manager')`. Renamed `chef` → `kitchen_staff` and folded `inventory_manager` into `manager` to match the 6-role platform-wide hierarchy in `SNAPORDER_AUTHORIZATION.md` (Guest → Waiter → Kitchen Staff → Manager → Owner → System Admin). System Admin is platform-level, not restaurant-scoped, so it belongs in a separate `platform_admins` table — not yet created (see Authorization doc, Part 6).
+- Migration 002 (2026-09-17) replaced this table's own `email` column + `unique_restaurant_email` constraint with `user_id` (FK to `users`) + `unique_user_per_restaurant`. One `users` row can now have multiple `restaurant_staff` rows — e.g. an Owner at more than one restaurant — without duplicating (and risking drift on) their password hash across rows.
 
 ---
 
@@ -628,9 +631,32 @@ CREATE UNIQUE INDEX unique_active_shift_per_staff ON shifts(staff_id) WHERE cloc
 
 ---
 
+### 19. `users`
+Login identity — email + password — independent of any restaurant. Added in migration 002 (2026-09-17), after the initial schema; referenced by `restaurant_staff.user_id` (table 2) despite the higher number here, since it was added later, not because it's less foundational. Guests are deliberately **not** in this table — no password, identified by phone number only (`guest_profiles`, table 10).
+
+```sql
+CREATE TABLE users (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  email VARCHAR(255) UNIQUE NOT NULL,
+  password_hash VARCHAR(255) NOT NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_users_email ON users(email);
+```
+
+Implementation notes (`backend/src/routes/auth.js`):
+- `password_hash` is a bcrypt hash (`bcryptjs`, cost factor 12), written with the async `bcrypt.hash()`/`bcrypt.compare()` — never the `*Sync` variants, which would block Node's single event loop thread for the ~100ms+ a hash takes, stalling every other in-flight request on the server.
+- Registration and login return the same generic "Invalid email or password" on any failure (no such email, or wrong password) — distinguishing them would let a client enumerate which emails have accounts.
+
+---
+
 ## Relationships Summary
 
 ```
+users ──── restaurant_staff (1:M)  (a user can be staff at more than one restaurant)
+
 restaurants
   ├─ restaurant_staff (1:M)
   │  └─ shifts (1:M)
@@ -661,6 +687,7 @@ feature_suggestions ──── suggestions_votes (1:M)
 - `idx_tables_qr_code` — QR scan lookup (instant)
 - `idx_guest_profiles_phone` — Guest lookup
 - `idx_order_items_order` — Order detail fetch
+- `idx_users_email` — Login lookup
 - `idx_shifts_restaurant_active` — Who's clocked in right now (kitchen queue ABAC scoping)
 
 **Reporting queries:**
@@ -706,7 +733,7 @@ BEFORE DELETE DO ... (application-level trigger recommended)
 
 ---
 
-**Schema Version:** 1.3 — applied as a real migration (`backend/database/migrations/001_initial_schema.sql`); fixed unenforced rating range and a non-working vote-uniqueness constraint (NULL-vs-NULL gap) found while translating to runnable SQL
+**Schema Version:** 1.4 — migration 002 added `users` (login identity) and moved `restaurant_staff.email`/credentials there, so one login can cover staff roles at multiple restaurants
 **Last Updated:** Sept 17, 2025
 **Status:** Implemented — see `backend/database/migrations/001_initial_schema.sql` and `backend/database/migrate.js`
 **Database:** PostgreSQL 13+ (running: postgres:15-alpine via docker-compose.yml, host port 5433)

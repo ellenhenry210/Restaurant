@@ -5,20 +5,23 @@
 - **Base URL:** `https://api.snaporder.ng/v1` (production)
 - **Format:** JSON
 - **Authentication:** Bearer JWT (OAuth 2.0)
-- **Rate Limiting:** 1000 requests/minute per API key
+- **Rate Limiting:** per-IP (see "Rate Limiting" section below for actual implemented limits — the original "1000/min per API key" here assumed an API-key model that doesn't exist yet; there's no API-key auth, only per-user JWTs)
 - **Versioning:** URL-based (`/v1`, `/v2` in future)
 
 ---
 
 ## Authentication Endpoints
 
-### POST `/auth/register`
-Register a new restaurant.
+Implemented in `backend/src/routes/auth.js`, mounted at `/v1/auth` (as of 2026-09-17 — see the versioning note below). Both routes sit behind `authLimiter` in addition to the global rate limiter (`backend/src/middleware/rateLimit.js`): 10 failed attempts / 15 min per IP.
+
+### POST `/v1/auth/register`
+Register a new restaurant, its first (Owner) user account, and the link between them, in one request.
 
 **Request:**
 ```json
 {
   "restaurant_name": "Tantalizers Nigeria",
+  "owner_name": "Ada Okafor",
   "email": "admin@tantalizers.ng",
   "phone": "+234 811 234 5678",
   "password": "SecurePassword123!",
@@ -26,6 +29,7 @@ Register a new restaurant.
   "registration_number": "RC 123456"
 }
 ```
+`restaurant_name`, `owner_name`, `email`, `password` (min 8 characters) are required. `owner_name` was added during implementation — the schema's `restaurant_staff.name` is required and there's no sensible default for a person's name, so it wasn't optional. `phone`/`address`/`registration_number` are optional.
 
 **Response (201):**
 ```json
@@ -38,9 +42,14 @@ Register a new restaurant.
 }
 ```
 
+**Response (409)** if the email is already registered (as a `users.email` or a `restaurants.email`):
+```json
+{ "error": { "code": "CONFLICT", "message": "An account with this email already exists" } }
+```
+
 ---
 
-### POST `/auth/login`
+### POST `/v1/auth/login`
 Restaurant staff login.
 
 **Request:**
@@ -55,16 +64,41 @@ Restaurant staff login.
 ```json
 {
   "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
-  "refresh_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
-  "expires_in": 3600,
+  "expires_in": 21600,
   "user": {
     "id": "uuid-here",
     "name": "Manager Name",
     "email": "admin@tantalizers.ng",
-    "role": "manager"
+    "role": "manager",
+    "restaurant_id": "uuid-here"
   }
 }
 ```
+No `refresh_token` — refresh-token issuance/rotation isn't implemented yet (tracked separately as a known gap); omitted rather than returning a fake one. `expires_in` (seconds) is read back from the actual issued token's `exp`/`iat`, so it always matches `JWT_EXPIRY` exactly rather than risking drift from a hardcoded value.
+
+**Response (401)** — deliberately the *same* message whether the email doesn't exist or the password is wrong, so a client can't use this endpoint to enumerate which emails have accounts:
+```json
+{ "error": { "code": "UNAUTHORIZED", "message": "Invalid email or password" } }
+```
+
+A user with no active `restaurant_staff` row gets **403 FORBIDDEN** ("This account has no active restaurant role") instead — they authenticated correctly, but there's nothing for them to do here.
+
+If a user has staff rows at more than one restaurant, login currently just picks the oldest one — there's no "choose which restaurant" step yet. Flagged as a real simplification, not an oversight (see `SNAPORDER_AUTHORIZATION.md` Part 0).
+
+---
+
+### GET `/v1/me`
+Not part of the original spec — added alongside the `authenticate` middleware (`backend/src/middleware/auth.js`) as the natural way to verify it end-to-end, and useful in its own right (e.g. a frontend checking "is my stored token still valid" on load).
+
+**Headers:** `Authorization: Bearer <access_token>`
+
+**Response (200):**
+```json
+{ "user": { "id": "uuid-here", "email": "admin@tantalizers.ng", "created_at": "2025-09-16T10:30:00Z" } }
+```
+Note this is the base `users` row only (id/email/created_at) — not role or restaurant_id, since `authenticate` is authentication only ("who are you"), not authorization ("what can you do where"). A route that needs role/restaurant context resolves it separately from `restaurant_staff`, scoped to whichever `:restaurantId` the request concerns.
+
+**Response (401)** if the `Authorization` header is missing/malformed, the token is invalid or expired, or the account it names no longer exists.
 
 ---
 
@@ -662,7 +696,7 @@ All errors follow this format:
 Implemented via `express-rate-limit` in `backend/src/middleware/rateLimit.js` (as of 2026-09-17). Two limiters, both keyed per-IP:
 
 - **General** (`generalLimiter`, applied to the whole API): 300 requests / 15 min. Skips `/health`.
-- **Auth** (`authLimiter`, not yet wired to a route — there's no `/auth/*` route yet): 10 *failed* attempts / 15 min. Successful requests don't count against it, so a legitimate user's own logins never trigger it — only repeated failures do.
+- **Auth** (`authLimiter`, applied to `/v1/auth/*`): 10 *failed* attempts / 15 min. Successful requests don't count against it, so a legitimate user's own logins never trigger it — only repeated failures do.
 
 **Headers in Response** — IETF draft-7 (`standardHeaders: 'draft-7'`), not the older `X-RateLimit-*` style:
 ```
@@ -675,7 +709,7 @@ Rate-limit state is in-memory (the library's default store) — correct for a si
 
 ---
 
-**API Version:** 1.1 — Rate Limiting section updated to match the actual implementation (was previously aspirational/undocumented format)
+**API Version:** 1.2 — Authentication Endpoints rewritten to match the actual implementation: routes now live under `/v1/auth`, `owner_name` added to register, `restaurant_id` added to login's user object, no `refresh_token` (not built), added `GET /v1/me`
 **Last Updated:** Sept 17, 2026  
 **Status:** Ready for implementation  
 **Protocol:** REST with WebSocket for KDS

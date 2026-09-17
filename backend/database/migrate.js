@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { pool } from '../src/db.js';
 
@@ -39,7 +39,7 @@ async function getAppliedMigrations(client) {
  * NOT continue on to later migrations, since they may assume the failed
  * one succeeded.
  */
-async function runMigrations() {
+export async function runMigrations() {
   const files = fs
     .readdirSync(MIGRATIONS_DIR)
     .filter((f) => f.endsWith('.sql'))
@@ -90,10 +90,19 @@ async function runMigrations() {
   }
 }
 
-runMigrations()
-  .then(() => pool.end())
-  .catch(async (err) => {
-    console.error('Migration run aborted:', err.message);
-    await pool.end();
-    process.exitCode = 1;
-  });
+// Only run as a standalone CLI command (`npm run migrate` / `node
+// database/migrate.js`) — NOT when this file is imported as a module
+// (e.g. by src/init-db.js, to run migrations at server startup). An
+// importer is part of a longer-running process and manages the pool's
+// lifecycle itself; calling pool.end() here unconditionally would kill
+// the server's only DB connection pool right after it starts.
+const isMainModule = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (isMainModule) {
+  runMigrations()
+    .then(() => pool.end())
+    .catch(async (err) => {
+      console.error('Migration run aborted:', err.message);
+      await pool.end();
+      process.exitCode = 1;
+    });
+}

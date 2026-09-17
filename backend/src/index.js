@@ -1,7 +1,10 @@
 import express from 'express';
 import dotenv from 'dotenv';
 
-import { generalLimiter } from './middleware/rateLimit.js';
+import { generalLimiter, authLimiter } from './middleware/rateLimit.js';
+import { authenticate } from './middleware/auth.js';
+import { initDb } from './init-db.js';
+import authRoutes from './routes/auth.js';
 
 dotenv.config();
 
@@ -22,6 +25,35 @@ app.get('/', (req, res) => {
   res.json({ message: 'SnapOrder API', version: '1.0.0' });
 });
 
-app.listen(PORT, () => {
-  console.log(`✅ Server running on http://localhost:${PORT}`);
+// /v1 prefix: this is the first real route mounted, so it's the right
+// moment to start versioning (SNAPORDER_GITHUB_SETUP.md already lists
+// "API versioning from day 1" as non-negotiable, and SNAPORDER_API_
+// CONTRACTS.md was designed around /v1/ throughout — it just hadn't
+// been wired up in code yet). authLimiter applies in addition to (not
+// instead of) the global generalLimiter, tightening the budget
+// specifically for login/register.
+app.use('/v1/auth', authLimiter, authRoutes);
+
+// A small "who am I" route — not explicitly requested, but the natural
+// way to prove the authenticate middleware works end-to-end, and
+// genuinely useful (e.g. for a frontend to check "is my token still
+// good" on load).
+app.get('/v1/me', authenticate, (req, res) => {
+  res.json({ user: req.user });
+});
+
+async function start() {
+  // Fail loudly before accepting any traffic if the schema can't be
+  // brought up to date, rather than serving requests against a database
+  // that's silently missing tables.
+  await initDb();
+
+  app.listen(PORT, () => {
+    console.log(`✅ Server running on http://localhost:${PORT}`);
+  });
+}
+
+start().catch((err) => {
+  console.error('❌ Failed to start server:', err.message);
+  process.exit(1);
 });
