@@ -7,6 +7,9 @@ import { initDb } from './init-db.js';
 import authRoutes from './routes/auth.js';
 import staffRoutes from './routes/staff.js';
 import guestSessionRoutes from './routes/guestSession.js';
+import restaurantRoutes from './routes/restaurants.js';
+import menuRoutes from './routes/menus.js';
+import orderRoutes from './routes/orders.js';
 
 dotenv.config();
 
@@ -52,6 +55,18 @@ app.use('/v1/restaurants/:restaurantId/staff', staffRoutes);
 // Not behind authenticate/authorize — guests have no staff identity at
 // all; see routes/guestSession.js and middleware/authGuest.js.
 app.use('/v1', guestSessionRoutes);
+
+// Public read endpoints — no auth. See routes/restaurants.js and
+// routes/menus.js for why (view_menu has no ABAC condition in the
+// permission matrix; a public directory/menu view is the natural
+// reading of that, distinct from ordering itself, which does require
+// a proximity-verified guest session below).
+app.use('/v1/restaurants', restaurantRoutes);
+app.use('/v1', menuRoutes); // /v1/restaurants/:id/menus, /v1/meals/:id, /v1/meals/:id/ingredients
+
+// Guest ordering — behind authenticateGuest. See routes/orders.js for
+// the full lifecycle and the allergen removal-policy enforcement.
+app.use('/v1/orders', orderRoutes);
 
 async function start() {
   // Fail loudly before accepting any traffic if the schema can't be

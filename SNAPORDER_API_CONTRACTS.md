@@ -10,6 +10,39 @@
 
 ---
 
+## Restaurants
+
+Implemented (2026-09-17) — `backend/src/routes/restaurants.js`. **Public — no auth.** New, not in earlier drafts of this doc, which always assumed a client already knows which restaurant it's dealing with (via QR scan). A directory/browse view was worth adding: same public-vs-internal split as the design intent elsewhere (return `name`/`description`/`address`/`logo_url`/`opening_hours` etc., never `email`/`registration_number`/`tax_id`/subscription dates/`max_guest_distance_meters`).
+
+### GET `/v1/restaurants`
+List active restaurants.
+
+**Query Params:** `page` (default 1), `per_page` (default 20, max 50 — bounded so this can't become an unbounded "return everything" query as the platform grows)
+
+**Response (200):**
+```json
+{
+  "data": [
+    {
+      "id": "uuid", "name": "Tantalizers Nigeria", "description": null,
+      "address": null, "city": null, "state": null, "country": "Nigeria",
+      "logo_url": null, "primary_color": null, "secondary_color": null,
+      "latitude": "6.524400", "longitude": "3.379200",
+      "opening_hours": { "monday": { "open": "09:00", "close": "22:00" }, "sunday": null },
+      "created_at": "2026-09-17T13:25:06.258Z"
+    }
+  ],
+  "pagination": { "total": 1, "page": 1, "per_page": 20 }
+}
+```
+
+### GET `/v1/restaurants/{id}`
+Single restaurant. Same public field set, plus `is_active` — an inactive restaurant is returned (not `404`), so a client can distinguish "temporarily unavailable" from "never existed" and show an appropriate message either way.
+
+**Response (404)** if the id doesn't exist or isn't validly formed.
+
+---
+
 ## Authentication Endpoints
 
 Implemented in `backend/src/routes/auth.js`, mounted at `/v1/auth` (as of 2026-09-17 — see the versioning note below). Both routes sit behind `authLimiter` in addition to the global rate limiter (`backend/src/middleware/rateLimit.js`): 10 failed attempts / 15 min per IP.
@@ -152,11 +185,13 @@ or `"This restaurant has not configured its location yet — guest ordering is u
 
 ## Menu Management
 
-### GET `/restaurants/{restaurantId}/menus`
+Implemented (2026-09-17): `GET /v1/restaurants/{restaurantId}/menus`, `GET /v1/meals/{id}`, `GET /v1/meals/{id}/ingredients` — `backend/src/routes/menus.js`. **Public — no auth.** `view_menu` (`SNAPORDER_AUTHORIZATION.md` Part 1) has no ABAC condition attached to it, unlike ordering — browsing is intentionally open even though placing an order requires a proximity-verified guest session (see Guest Session, Orders below).
+
+### GET `/v1/restaurants/{restaurantId}/menus`
 Get all menus for a restaurant.
 
 **Query Params:**
-- `active_only=true` — Only return active menus
+- `active_only` — defaults to `true` (only `is_active=true` menus); pass `active_only=false` to see everything.
 
 **Response (200):**
 ```json
@@ -172,232 +207,134 @@ Get all menus for a restaurant.
       "categories_count": 5,
       "meals_count": 32
     }
-  ],
-  "pagination": {
-    "total": 2,
-    "page": 1,
-    "per_page": 10
-  }
+  ]
 }
 ```
+`categories_count`/`meals_count` come from one `LEFT JOIN` + `GROUP BY` query, not a loop of per-menu queries (N+1) — see the code comments in `menus.js`. `meals_count` only counts `is_available = true` meals.
 
 ---
 
-### GET `/restaurants/{restaurantId}/menus/{menuId}/meals`
-Get all meals in a menu (for guest ordering).
-
-**Query Params:**
-- `category_id=uuid` — Filter by category
-- `search=text` — Search meal names
-- `available_only=true` — Only available meals
+### GET `/v1/meals/{id}`
+Meal details, with ingredients and addons joined in. **Not yet built:** listing all meals in a specific menu (`GET /restaurants/{restaurantId}/menus/{menuId}/meals` from an earlier draft of this doc) — meals are currently only fetched one at a time by id.
 
 **Response (200):**
 ```json
 {
-  "data": [
-    {
-      "id": "uuid",
-      "name": "Grilled Chicken Rice",
-      "description": "Fresh chicken grilled with jasmine rice",
-      "price": 2500,
-      "image_url": "https://...",
-      "calories": 450,
-      "protein_grams": 28,
-      "is_available": true,
-      "is_vegan": false,
-      "is_vegetarian": false,
-      "is_low_calorie": false,
-      "is_high_protein": true,
-      "estimated_prep_time_minutes": 15,
-      "ingredients": [
-        {
-          "id": "uuid",
-          "name": "Chicken breast",
-          "can_be_removed": true,
-          "allergen_type": "none"
-        },
-        {
-          "id": "uuid",
-          "name": "Rice",
-          "can_be_removed": false,
-          "allergen_type": "none"
-        }
-      ],
-      "addons": [
-        {
-          "id": "uuid",
-          "name": "Extra Chicken",
-          "additional_price": 800
-        }
-      ],
-      "reviews": {
-        "average_rating": 4.5,
-        "total_reviews": 23,
-        "recent": [
-          {
-            "rating": 5,
-            "review": "Amazing! So fresh.",
-            "has_photo": true,
-            "posted_at": "2025-09-15T14:20:00Z"
-          }
-        ]
-      }
-    }
+  "id": "uuid",
+  "name": "Grilled Chicken Rice",
+  "description": "Fresh chicken grilled with jasmine rice",
+  "base_price": "2500.00",
+  "currency": "NGN",
+  "calories": 450,
+  "protein_grams": 28,
+  "is_available": true,
+  "category_name": "Mains",
+  "ingredients": [
+    { "id": "uuid", "name": "Chicken breast", "allergen_type": "none", "removal_policy": "can_remove", "removal_policy_reason": null, "is_required": false },
+    { "id": "uuid", "name": "Rice", "allergen_type": "none", "removal_policy": "cannot_remove", "removal_policy_reason": "Cooked together, can't be separated" }
   ],
-  "pagination": { ... }
+  "addons": [
+    { "id": "uuid", "name": "Extra Chicken", "additional_price": "800.00", "max_quantity": 1 }
+  ]
 }
 ```
+Note: `removal_policy` (3-state: `can_remove`/`caution`/`cannot_remove`) replaces an earlier draft's boolean `can_be_removed` shown in this doc previously — that boolean was never accurate once `SNAPORDER_DATABASE_SCHEMA.md`'s allergen policy engine (table 8) landed; this section just hadn't been updated to match until now. No `reviews` aggregate yet (`guest_reviews` querying isn't wired to this endpoint).
+
+**Response (404)** if the meal doesn't exist.
+
+---
+
+### GET `/v1/meals/{id}/ingredients`
+Just the ingredient list from the endpoint above, as its own lighter-weight fetch (e.g. an allergen-check UI that doesn't need the rest of the meal payload).
+
+**Response (200):** `{ "data": [ ...same ingredient objects as above... ] }`
 
 ---
 
 ### POST `/restaurants/{restaurantId}/menus/{menuId}/meals`
-Create a new meal (restaurant admin only).
-
-**Request:**
-```json
-{
-  "name": "Grilled Tilapia",
-  "description": "Fresh tilapia with olive oil",
-  "category_id": "uuid",
-  "base_price": 3500,
-  "calories": 350,
-  "protein_grams": 35,
-  "carbs_grams": 0,
-  "fat_grams": 15,
-  "is_vegan": false,
-  "is_vegetarian": false,
-  "is_gluten_free": true,
-  "is_high_protein": true,
-  "estimated_prep_time_minutes": 12,
-  "ingredients": [
-    {
-      "id": "ingredient_uuid",
-      "can_be_removed": false,
-      "is_required": true
-    }
-  ]
-}
-```
-
-**Response (201):** Returns created meal object
+Create a new meal (restaurant admin only). **Not implemented** — menu/meal data is currently seeded directly via SQL; no write endpoint exists yet. Kept here as the design target for when one is built.
 
 ---
 
 ## Orders
 
-### POST `/tables/{tableId}/orders`
-Place an order (guest).
+Implemented (2026-09-17): `POST /v1/orders`, `GET /v1/orders/{id}` — `backend/src/routes/orders.js`. Both behind `authenticateGuest` — this **supersedes an earlier draft** of this section that used `POST /tables/{tableId}/orders` with an `X-Guest-Phone` header, which predates the guest-session work (`SNAPORDER_AUTHORIZATION.md` Part 2 condition 6) and no longer reflects how guest identity actually works. `guest_profiles` are created here, on first order, exactly as the product design always specified — not at scan time.
 
-**Headers:**
-```
-Content-Type: application/json
-X-Guest-Phone: +234 811 234 5678 (or session token)
-```
+### POST `/v1/orders`
+Place an order.
+
+**Headers:** `Authorization: Bearer <guest session_token>` (from `POST /v1/tables/{qrCodeId}/scan`)
 
 **Request:**
 ```json
 {
+  "phone_number": "+234 811 234 5678",
+  "guest_name": "Adeola K.",
   "items": [
     {
       "meal_id": "uuid",
       "quantity": 1,
       "removed_ingredients": ["ingredient_uuid_1"],
+      "allergen_caution_acknowledged": false,
       "added_addons": ["addon_uuid_1"],
       "special_request": "No oil, extra spicy"
     }
   ],
-  "special_requests": "Table is allergic to peanuts",
-  "payment_method": "card"  // or "cash", "bank_transfer"
+  "special_requests": "Table is allergic to peanuts"
 }
 ```
+`removed_ingredients` are checked against each ingredient's `removal_policy` (`SNAPORDER_AUTHORIZATION.md` Part 3) for **every** item before anything is written:
+- `cannot_remove` → whole order rejected, **403**, no partial order created.
+- `caution` → requires that item's `allergen_caution_acknowledged: true`, else **400** asking for it.
+- `can_remove` → honored silently.
+
+`table_id`/`restaurant_id` are NOT in the request body — they come from the authenticated guest session, so a guest can only ever order for the table they actually scanned.
 
 **Response (201):**
 ```json
 {
   "id": "order_uuid",
-  "order_number": "ORD-2025-00147",
-  "table_id": "uuid",
+  "order_number": "ORD-2026-00147",
   "status": "placed",
-  "items": [ ... ],
-  "subtotal": 6500,
-  "tax": 650,
-  "total_amount": 7150,
+  "subtotal": "6600.00",
+  "total_amount": "6600.00",
   "currency": "NGN",
-  "estimated_ready_time_minutes": 15,
-  "placed_at": "2025-09-16T10:30:00Z",
-  "payment_required": true,
-  "payment_url": "https://paystack.com/pay/xyz123"  // if payment_method="card"
+  "placed_at": "2026-09-17T10:30:00Z",
+  "items": [
+    { "id": "item_uuid", "meal_id": "uuid", "meal_name": "Grilled Chicken Rice", "meal_price": "3300.00", "quantity": 2, "status": "pending" }
+  ]
 }
 ```
+`meal_price` on each item is `base_price + sum(addon prices)` — a **snapshot** at order time, so a later menu price change never retroactively changes an already-placed order. **No `tax`/`service_charge`/`payment_url`** — not implemented (no tax rate is defined anywhere in the schema/design), so `total_amount` currently equals `subtotal` exactly; flagged rather than a made-up percentage. No payment integration either (see known gaps).
+
+**Response (400)** for a meal that doesn't exist/isn't at this restaurant, an unavailable meal, an addon that isn't valid for the meal, or a missing `caution` acknowledgment. **Response (403)** for a blocked (`cannot_remove`) ingredient removal.
 
 ---
 
-### GET `/orders/{orderId}`
-Get order details (guest can track, restaurant can fulfill).
+### GET `/v1/orders/{id}`
+Get order status. Ownership is table-based: the order's `table_id` must match the authenticated guest session's `table_id` — see `orders.js` for why this is more correct than matching on `guest_profile_id` (a re-scan starts a new session whose `guest_profile_id` is null again until it orders).
+
+**Headers:** `Authorization: Bearer <guest session_token>`
 
 **Response (200):**
 ```json
 {
   "id": "order_uuid",
-  "order_number": "ORD-2025-00147",
-  "status": "preparing",
+  "order_number": "ORD-2026-00147",
+  "status": "placed",
+  "placed_at": "2026-09-17T10:30:00Z",
+  "confirmed_at": null,
+  "ready_at": null,
+  "total_amount": "6600.00",
   "items": [
-    {
-      "id": "item_uuid",
-      "meal_name": "Grilled Chicken Rice",
-      "quantity": 1,
-      "status": "preparing",
-      "estimated_minutes_left": 8,
-      "special_request": "No oil"
-    }
-  ],
-  "total_amount": 7150,
-  "placed_at": "2025-09-16T10:30:00Z",
-  "estimated_ready_at": "2025-09-16T10:45:00Z",
-  "updates": [
-    {
-      "status": "confirmed",
-      "timestamp": "2025-09-16T10:31:00Z",
-      "message": "Your order is confirmed. Preparing now."
-    },
-    {
-      "status": "preparing",
-      "timestamp": "2025-09-16T10:32:00Z",
-      "message": "Your chicken is grilling. 13 minutes left."
-    }
+    { "id": "item_uuid", "meal_name": "Grilled Chicken Rice", "quantity": 2, "status": "pending", "special_request": "Extra spicy" }
   ]
 }
 ```
 
----
+**Response (403)** `"This order does not belong to your table"` if the order exists but belongs to a different table. **Response (404)** if it doesn't exist at all — verified live that these two cases are distinguishable to a legitimate caller.
 
-### PATCH `/orders/{orderId}/status`
-Update order status (restaurant staff).
-
-**Request:**
-```json
-{
-  "status": "ready",
-  "message": "Order ready for collection at Table 5"
-}
-```
-
-**Response (200):** Updated order object
-
----
-
-### POST `/orders/{orderId}/items/{itemId}/status`
-Update individual meal status (kitchen).
-
-**Request:**
-```json
-{
-  "status": "ready",
-  "estimated_minutes_left": 0
-}
-```
-
-**Response (200):** Updated item object
+**Not yet implemented — staff/kitchen side:** `PATCH /orders/{id}/status` (restaurant staff advancing an order's status) and updating individual item status (kitchen). Guests can create and check their own orders; nothing on the restaurant side can act on them yet. `view_all_orders`, `cancel_order`, `modify_order` (`SNAPORDER_AUTHORIZATION.md` Part 1) remain unenforced — no routes exist for them.
 
 ---
 
@@ -785,7 +722,7 @@ Rate-limit state is in-memory (the library's default store) — correct for a si
 
 ---
 
-**API Version:** 1.4 — added Guest Session section (`POST /v1/tables/{qrCodeId}/scan`, `GET /v1/guest/session`) — proximity-gated guest access
+**API Version:** 1.5 — added Restaurants section (new); rewrote Menu Management and Orders to match the real implementation (`removal_policy` 3-state replacing a stale boolean, guest-session-based order creation replacing the old `X-Guest-Phone` draft, no fake `tax`/`payment_url`)
 **Last Updated:** Sept 17, 2026  
 **Status:** Ready for implementation  
 **Protocol:** REST with WebSocket for KDS

@@ -1,0 +1,22 @@
+-- 006_restaurant_opening_hours.sql
+--
+-- restaurants had no way to express "when are you open" at all. JSONB
+-- rather than a separate restaurant_hours table: a weekly schedule is
+-- fixed-shape (7 days), read far more often than written, and never
+-- filtered/joined on in a query (nothing does "find restaurants open at
+-- 3pm right now") — a whole table for that is more structure than the
+-- access pattern justifies. Revisit as a real table if that changes.
+--
+-- Expected shape (documented here since JSONB can't enforce it via
+-- CHECK without real complexity — validate at the application layer
+-- whenever a "set my hours" endpoint gets built; none exists yet, this
+-- migration only adds the column for the read side):
+--   {
+--     "monday":    {"open": "09:00", "close": "22:00"},
+--     "tuesday":   {"open": "09:00", "close": "22:00"},
+--     ...
+--     "sunday":    null   -- null/absent = closed that day
+--   }
+-- Times are restaurant-local (restaurants.timezone), 24h "HH:MM".
+
+ALTER TABLE restaurants ADD COLUMN opening_hours JSONB;

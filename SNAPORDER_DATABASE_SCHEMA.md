@@ -50,6 +50,11 @@ CREATE TABLE restaurants (
   
   -- Operational
   timezone VARCHAR(50) DEFAULT 'Africa/Lagos',
+  -- Weekly schedule (migration 006, 2026-09-17), JSONB rather than a
+  -- separate table — see that migration for why. Shape:
+  -- {"monday": {"open": "09:00", "close": "22:00"}, ..., "sunday": null}
+  -- (null/absent = closed that day). No write endpoint yet.
+  opening_hours JSONB,
   is_active BOOLEAN DEFAULT TRUE,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -361,7 +366,7 @@ CREATE INDEX idx_guest_profiles_restaurant ON guest_profiles(restaurant_id);
 ---
 
 ### 11. `orders`
-Guest orders.
+Guest orders. `order_number` values (e.g. `ORD-2026-00147`) are generated from `order_number_seq` (migration 007, 2026-09-17) — `SELECT nextval('order_number_seq')`, not `COUNT(*) + 1`, since a count-based scheme races under concurrent order placement (a `SEQUENCE` is atomic across concurrent transactions; a count isn't). Simplification worth knowing: the sequence does not reset each year — the year in the number is just whatever year it is at issue time, so numbering continues past `00999` into the next year rather than restarting at `00001`.
 
 ```sql
 CREATE TABLE orders (
@@ -801,7 +806,7 @@ BEFORE DELETE DO ... (application-level trigger recommended)
 
 ---
 
-**Schema Version:** 1.5 — migrations 003-005: `restaurants` gained `latitude`/`longitude`/`max_guest_distance_meters` and `guest_sessions` for proximity-gated guest access (see `SNAPORDER_AUTHORIZATION.md` Part 2 condition 6); `platform_admins` for the System Admin role; `audit_log.restaurant_id` made nullable for platform-level (non-restaurant-scoped) audit entries
+**Schema Version:** 1.6 — migration 006 added `restaurants.opening_hours` (JSONB); migration 007 added `order_number_seq` (atomic, concurrency-safe order numbering, replacing the previously-unimplemented `order_number` generation)
 **Last Updated:** Sept 17, 2025
 **Status:** Implemented — see `backend/database/migrations/001_initial_schema.sql` and `backend/database/migrate.js`
 **Database:** PostgreSQL 13+ (running: postgres:15-alpine via docker-compose.yml, host port 5433)
