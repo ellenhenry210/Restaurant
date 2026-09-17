@@ -1,54 +1,94 @@
-// Scaffolding, not yet wired in — see routes/menus.js for the actual,
-// currently-running implementation. Same reasoning as
-// models/restaurantModel.js: not filled in yet, to avoid two
-// independent copies of the same query logic drifting apart.
-
-// import { pool } from '../db.js'; — uncomment when implementing
+import { pool } from '../db.js';
 
 /**
  * List a restaurant's menus, with categories_count/meals_count.
- * Mirrors routes/menus.js `GET /restaurants/:restaurantId/menus` (the
- * live version's single JOIN + GROUP BY query, avoiding N+1).
+ *
+ * One query, not N+1: the counts are computed via LEFT JOIN +
+ * COUNT(DISTINCT ...) + GROUP BY, in the same query as the menu rows
+ * themselves. The tempting-looking alternative — fetch the menus, then
+ * loop over them running a "how many meals" query per menu — is the
+ * classic N+1 pattern: fine with 2 menus, a real cost with 20. A LEFT
+ * JOIN (not INNER) is what makes a menu with zero categories yet still
+ * show up (with counts of 0) instead of silently disappearing.
  *
  * @param {string} restaurantId
  * @param {{ activeOnly: boolean }} options
  * @returns {Promise<object[]>}
  */
 export async function findMenusByRestaurant(restaurantId, { activeOnly }) {
-  throw new Error('menuModel.findMenusByRestaurant: not implemented — see routes/menus.js for the live version');
+  const result = await pool.query(
+    `SELECT
+       m.id, m.name, m.description, m.is_active, m.active_from, m.active_until,
+       COUNT(DISTINCT mc.id) AS categories_count,
+       COUNT(DISTINCT meals.id) FILTER (WHERE meals.is_available = TRUE) AS meals_count
+     FROM menus m
+     LEFT JOIN meal_categories mc ON mc.menu_id = m.id
+     LEFT JOIN meals ON meals.category_id = mc.id
+     WHERE m.restaurant_id = $1
+       AND ($2::boolean IS FALSE OR m.is_active = TRUE)
+     GROUP BY m.id
+     ORDER BY m.created_at ASC`,
+    [restaurantId, activeOnly]
+  );
+  return result.rows;
 }
 
 /**
  * Fetch one meal, with its category name joined in.
- * Mirrors routes/menus.js `GET /meals/:id`.
- *
  * @param {string} mealId
  * @returns {Promise<object|null>}
  */
 export async function findMealById(mealId) {
-  throw new Error('menuModel.findMealById: not implemented — see routes/menus.js for the live version');
+  const result = await pool.query(
+    `SELECT meals.*, mc.name AS category_name
+     FROM meals
+     JOIN meal_categories mc ON mc.id = meals.category_id
+     WHERE meals.id = $1`,
+    [mealId]
+  );
+  return result.rows[0] ?? null;
+}
+
+/** Bare existence check — used by getIngredients() to distinguish "meal
+ * has no ingredients" from "meal doesn't exist" without fetching the
+ * whole meal row. */
+export async function mealExists(mealId) {
+  const result = await pool.query('SELECT id FROM meals WHERE id = $1', [mealId]);
+  return result.rows.length > 0;
 }
 
 /**
  * Fetch a meal's ingredients, joined with allergen/removal-policy info.
- * Mirrors routes/menus.js `GET /meals/:id/ingredients` — the same query
- * as the ingredients portion of findMealById above, kept separate
- * because the route it backs is deliberately lighter-weight.
- *
  * @param {string} mealId
  * @returns {Promise<object[]>}
  */
 export async function findIngredientsByMealId(mealId) {
-  throw new Error('menuModel.findIngredientsByMealId: not implemented — see routes/menus.js for the live version');
+  const result = await pool.query(
+    `SELECT
+       mi.id, i.name, i.allergen_type,
+       mi.removal_policy, mi.removal_policy_reason, mi.is_required,
+       mi.quantity, mi.unit_of_measure
+     FROM meal_ingredients mi
+     JOIN ingredients i ON i.id = mi.ingredient_id
+     WHERE mi.meal_id = $1
+     ORDER BY mi.sort_order ASC`,
+    [mealId]
+  );
+  return result.rows;
 }
 
 /**
- * Fetch a meal's addons.
- * Mirrors the addons portion of routes/menus.js `GET /meals/:id`.
- *
+ * Fetch a meal's available addons.
  * @param {string} mealId
  * @returns {Promise<object[]>}
  */
 export async function findAddonsByMealId(mealId) {
-  throw new Error('menuModel.findAddonsByMealId: not implemented — see routes/menus.js for the live version');
+  const result = await pool.query(
+    `SELECT id, name, description, additional_price, max_quantity
+     FROM meal_addons
+     WHERE meal_id = $1 AND is_available = TRUE
+     ORDER BY sort_order ASC`,
+    [mealId]
+  );
+  return result.rows;
 }
