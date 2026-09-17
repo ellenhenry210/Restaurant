@@ -21,7 +21,12 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U snaporder_user"]
+      # -d snaporder is required here: without it, pg_isready defaults the
+      # target database to the username (snaporder_user), which doesn't
+      # exist, so every check logs a "FATAL: database ... does not exist"
+      # even though the server itself is healthy and the check still
+      # passes (pg_isready only needs a response, not a valid database).
+      test: ["CMD-SHELL", "pg_isready -U snaporder_user -d snaporder"]
       interval: 10s
       timeout: 5s
       retries: 5
