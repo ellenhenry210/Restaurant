@@ -4,6 +4,8 @@
 
 **Design Principle:** Relational model, normalized to 3NF, with thoughtful indexes for real-time queries.
 
+**A note on `ENUM(...)` in this doc:** it's used below as design shorthand for "this column only allows these values" — Postgres has no MySQL-style inline `ENUM(...)` column syntax, so this isn't literal runnable SQL. The actual migration (`backend/database/migrations/001_initial_schema.sql`, applied via `npm run migrate`) implements every one of these as `VARCHAR` + a named `CHECK` constraint instead — easier to extend later (no `ALTER TYPE` needed to add a value) than a native Postgres enum type, which matters given the `role` values here have already been renamed once. That migration is the source of truth for what's actually running; this doc is the readable reference.
+
 ---
 
 ## Core Tables
@@ -450,7 +452,7 @@ CREATE TABLE guest_reviews (
   meal_id UUID NOT NULL REFERENCES meals(id) ON DELETE CASCADE,
   guest_profile_id UUID NOT NULL REFERENCES guest_profiles(id) ON DELETE CASCADE,
   
-  rating INT NOT NULL,  -- 1-5 stars
+  rating INT NOT NULL CHECK (rating BETWEEN 1 AND 5),  -- 1-5 stars, enforced
   review_text TEXT,  -- Optional written review
   photo_url TEXT,  -- Optional meal photo
   
@@ -537,11 +539,26 @@ CREATE TABLE suggestions_votes (
   voted_by_staff_id UUID REFERENCES restaurant_staff(id) ON DELETE SET NULL,
   
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  
-  CONSTRAINT unique_vote_per_user UNIQUE (suggestion_id, voted_by_guest_id, voted_by_staff_id)
+
+  CONSTRAINT chk_vote_single_voter CHECK (
+    (voted_by_guest_id IS NOT NULL AND voted_by_staff_id IS NULL)
+    OR (voted_by_guest_id IS NULL AND voted_by_staff_id IS NOT NULL)
+  )
 );
 
 CREATE INDEX idx_votes_suggestion ON suggestions_votes(suggestion_id);
+
+-- NOT a single 3-column UNIQUE (suggestion_id, voted_by_guest_id, voted_by_staff_id):
+-- Postgres treats NULL as distinct from NULL in uniqueness checks, so that
+-- constraint would never actually block the same guest voting twice (their
+-- voted_by_staff_id is NULL both times). Two partial unique indexes instead:
+CREATE UNIQUE INDEX unique_guest_vote_per_suggestion
+  ON suggestions_votes(suggestion_id, voted_by_guest_id)
+  WHERE voted_by_guest_id IS NOT NULL;
+
+CREATE UNIQUE INDEX unique_staff_vote_per_suggestion
+  ON suggestions_votes(suggestion_id, voted_by_staff_id)
+  WHERE voted_by_staff_id IS NOT NULL;
 ```
 
 ---
@@ -689,7 +706,7 @@ BEFORE DELETE DO ... (application-level trigger recommended)
 
 ---
 
-**Schema Version:** 1.2 — added `shifts` table for ABAC session-context scoping, see `SNAPORDER_AUTHORIZATION.md`
+**Schema Version:** 1.3 — applied as a real migration (`backend/database/migrations/001_initial_schema.sql`); fixed unenforced rating range and a non-working vote-uniqueness constraint (NULL-vs-NULL gap) found while translating to runnable SQL
 **Last Updated:** Sept 17, 2025
-**Status:** Ready for implementation
-**Database:** PostgreSQL 13+
+**Status:** Implemented — see `backend/database/migrations/001_initial_schema.sql` and `backend/database/migrate.js`
+**Database:** PostgreSQL 13+ (running: postgres:15-alpine via docker-compose.yml, host port 5433)
